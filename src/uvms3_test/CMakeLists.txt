@@ -23,6 +23,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/HalLightControl.msg"
   "msg/HalModeControl.msg"
   "msg/HalRemoteControl.msg"
+  "msg/HalDVLControl.msg"
   
   "srv/HalBatteryControl.srv"
 )

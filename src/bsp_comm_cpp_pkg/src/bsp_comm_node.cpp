@@ -19,6 +19,7 @@
 #include "uvms3_test/msg/hal_light_control.hpp"
 #include "uvms3_test/msg/hal_mode_control.hpp"
 #include "uvms3_test/msg/hal_remote_control.hpp"
+#include "uvms3_test/msg/hal_dvl_control.hpp"
 
 #include "uvms3_test/srv/hal_battery_control.hpp"
 
@@ -69,6 +70,7 @@ public:
         light_control_pub_      = this->create_publisher<uvms3_test::msg::HalLightControl>("/hal/lightcontrol", 10);
         mode_control_pub_       = this->create_publisher<uvms3_test::msg::HalModeControl>("/hal/modecontrol", 10);
         remote_control_pub_     = this->create_publisher<uvms3_test::msg::HalRemoteControl>("/hal/remotecontrol", 10);
+        dvl_control_pub_        = this->create_publisher<uvms3_test::msg::HalDVLControl>("/hal/dvlcontrol", 10);
         
         battery_control_client_ = this->create_client<uvms3_test::srv::HalBatteryControl>("/hal/batterycontrol");
  
@@ -132,6 +134,7 @@ public:
         if (antenna_control_pub_) {antenna_control_pub_->on_activate();}
         if (mode_control_pub_) {mode_control_pub_->on_activate();}
         if (remote_control_pub_) {remote_control_pub_->on_activate();}
+        if (dvl_control_pub_) {dvl_control_pub_->on_activate();}
     }
 
     CallbackReturn on_deactivate(const rclcpp_lifecycle::State &)
@@ -744,6 +747,7 @@ private:
     rclcpp_lifecycle::LifecyclePublisher<uvms3_test::msg::HalLightControl>::SharedPtr light_control_pub_;
     rclcpp_lifecycle::LifecyclePublisher<uvms3_test::msg::HalModeControl>::SharedPtr mode_control_pub_;
     rclcpp_lifecycle::LifecyclePublisher<uvms3_test::msg::HalRemoteControl>::SharedPtr remote_control_pub_;
+    rclcpp_lifecycle::LifecyclePublisher<uvms3_test::msg::HalDVLControl>::SharedPtr dvl_control_pub_;
     rclcpp::Client<uvms3_test::srv::HalBatteryControl>::SharedPtr battery_control_client_;
 
     std::optional<uvms3_test::msg::HalInertialnavi> inertial_data_;
@@ -900,6 +904,20 @@ private:
         remote_control_pub_->publish(msg);
 
         RCLCPP_INFO(this->get_logger(), "Remote control: %.3f %.3f %.3f %.3f %.3f %.3f", tunnel1, tunnel2, tunnel3, tunnel4, tunnel5, tunnel6);
+    }
+    
+    // DVL控制 
+    void dvl_control(const std::vector<uint8_t>& payload)
+    {
+        if(payload.size() != 1) {RCLCPP_WARN(this->get_logger(), "DVL command payload length error: %ld", payload.size()); return;}
+
+        uint8_t dvl_cmd = payload[0];
+
+        auto msg = uvms3_test::msg::HalDVLControl();
+        msg.dvlcontrol_cmd = dvl_cmd;
+        dvl_control_pub_->publish(msg);
+
+        RCLCPP_INFO(this->get_logger(),"Publish DVL control command: %d", dvl_cmd);
     }
     
     void battery_control(const std::vector<uint8_t>& payload)
