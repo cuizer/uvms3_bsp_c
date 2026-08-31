@@ -17,7 +17,8 @@
  *
  * ## 输出 (Publishers)
  *   - /hal/thruster/cmd    (Float64MultiArray):  推进器指令
- *         data[0] = 主推百分比, data[1..5] = 5路辅推百分比
+ *         data[0] = 主推百分比 (CAN ID 0x301)
+ *         data[1..5] = 辅推电调 ID2..ID6 百分比
  *   - /hal/servo/tail_cmd  (Float64MultiArray):  [框架] 尾舵指令
  *   - /hal/servo/wing_cmd  (Float64MultiArray):  [框架] 翼舵指令
  *
@@ -291,10 +292,10 @@
  
          // ----- 控制分配矩阵 T (6×6, 行优先) -----
          //  T ∈ R^(6×6):   τ = T · u
-         //  列顺序: [Main, Aux0, Aux1, Aux2, Aux3, Aux4]
+         //  列/输出顺序: [主推0x301, 辅推ID2, 辅推ID3, 辅推ID4, 辅推ID5, 辅推ID6]
          //  行顺序: [Fx, Fy, Fz, Mx, My, Mz]
          std::vector<double> default_T = {
-             // Main  Aux0  Aux1  Aux2  Aux3  Aux4
+             // Main  ID2   ID3   ID4   ID5   ID6
                 1.0,  0.0,  0.0,  0.0,  0.5,  0.5,  // Fx
                 0.0,  0.0,  0.0,  1.0,  1.0,  0.0,  // Fy
                 0.0,  1.0,  1.0,  0.0,  0.0,  0.0,  // Fz
@@ -866,10 +867,10 @@
  
          // 6. 发布推进器指令
          auto cmd_msg = std_msgs::msg::Float64MultiArray();
-         cmd_msg.data.resize(6);  // 1主推 + 5辅推
-         cmd_msg.data[0] = thruster_cmds[0];             // 主推
+         cmd_msg.data.resize(6);  // [主推0x301, 辅推ID2, ID3, ID4, ID5, ID6]
+         cmd_msg.data[0] = thruster_cmds[0];             // 推进器1: 主推 CAN ID 0x301
          for (size_t i = 0; i < 5; ++i) {
-             cmd_msg.data[i + 1] = thruster_cmds[i + 1]; // 辅推 0~4
+             cmd_msg.data[i + 1] = thruster_cmds[i + 1]; // 推进器2~6: 辅推电调 ID2~ID6
          }
          thruster_cmd_pub_->publish(cmd_msg);
  
