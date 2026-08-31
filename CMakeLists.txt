@@ -100,7 +100,11 @@ add_executable(bsp_arm_trajectory_node src/bsp_arm_trajectory_node.cpp)
 ament_target_dependencies(bsp_arm_trajectory_node rclcpp sensor_msgs trajectory_msgs)
 
 
+# 5. 监测节点
 
+add_executable(sys_monitor_node src/sys_monitor_node.cpp)
+
+ament_target_dependencies(sys_monitor_node  rclcpp  lifecycle_msgs  std_msgs)
 # ==============================================================================
 
 # 安装与导出
@@ -116,6 +120,8 @@ install(TARGETS
   bsp_remotecontrol_node
 
   bsp_arm_trajectory_node
+  
+  sys_monitor_node
 
   DESTINATION lib/${PROJECT_NAME}
 
