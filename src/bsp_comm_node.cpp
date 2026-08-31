@@ -1,6 +1,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
-
+#include <std_msgs/msg/u_int8_multi_array.hpp> 
 #include <sensor_msgs/msg/image.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
@@ -63,7 +63,15 @@ public:
         tailservo_sub_    = this->create_subscription<hal::msg::HalTailservo>("/hal/tailservo",qos,std::bind(&BspCommNode::tailservo_callback, this, std::placeholders::_1));
         armmotor_sub_     = this->create_subscription<hal::msg::HalArmmotor>("/hal/armmotor",qos,std::bind(&BspCommNode::armmotor_callback, this, std::placeholders::_1));
         antenna_sub_      = this->create_subscription<hal::msg::HalAntenna>("/hal/antenna",qos,std::bind(&BspCommNode::antenna_callback, this, std::placeholders::_1));
-        
+        // 订阅系统生命周期状态并直接 UDP 下发 (指令码 0x0D)
+        sys_state_sub_ = this->create_subscription<std_msgs::msg::UInt8MultiArray>("/system/lifecycle_states", qos,[this](const std_msgs::msg::UInt8MultiArray::SharedPtr msg) {
+                if (!active_) return; // 只有网关处于 active 状态才发送
+                // 将 std::vector<uint8_t> 直接封装并发送
+                auto packet = build_packet(0x0D, msg->data);
+                sendto(sock_, packet.data(), packet.size(), 0, 
+                       reinterpret_cast<struct sockaddr*>(&target_addr_), sizeof(target_addr_));
+            }
+        );
         // color_image_sub_  = this->create_subscription<sensor_msgs::msg::Image>("/uvms/perception/image_raw",rclcpp::SensorDataQoS(),std::bind(&BspCommNode::color_image_callback, this, std::placeholders::_1));
         // depth_image_sub_  = this->create_subscription<sensor_msgs::msg::Image>("/uvms/perception/depth",rclcpp::SensorDataQoS(),std::bind(&BspCommNode::depth_image_callback, this, std::placeholders::_1));
         
@@ -745,6 +753,7 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr color_image_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_image_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
+    rclcpp::Subscription<std_msgs::msg::UInt8MultiArray>::SharedPtr sys_state_sub_;
     
     rclcpp_lifecycle::LifecyclePublisher<hal::msg::HalAntennaControl>::SharedPtr antenna_control_pub_;
     rclcpp_lifecycle::LifecyclePublisher<hal::msg::HalLightControl>::SharedPtr light_control_pub_;
