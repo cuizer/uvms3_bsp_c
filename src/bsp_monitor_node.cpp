@@ -7,7 +7,7 @@
 class SysMonitorNode : public rclcpp::Node
 {
 public:
-    SysMonitorNode() : Node("sys_monitor_node")
+    SysMonitorNode() : Node("bsp_monitor_node")
     {
         target_nodes_ = {
             "hal_thruster_node", "hal_servo_node", "hal_antennacontrol_node",
