@@ -105,6 +105,14 @@ ament_target_dependencies(bsp_arm_trajectory_node rclcpp sensor_msgs trajectory_
 add_executable(bsp_monitor_node src/bsp_monitor_node.cpp)
 
 ament_target_dependencies(bsp_monitor_node  rclcpp  lifecycle_msgs  std_msgs)
+
+
+# 6. 下位机自启动管理节点
+
+add_executable(bsp_startupmanager_node src/bsp_startupmanager_node.cpp)
+
+ament_target_dependencies(bsp_startupmanager_node
+  rclcpp lifecycle_msgs std_msgs hal)
 # ==============================================================================
 
 # 安装与导出
@@ -122,6 +130,8 @@ install(TARGETS
   bsp_arm_trajectory_node
   
   bsp_monitor_node
+
+  bsp_startupmanager_node
 
   DESTINATION lib/${PROJECT_NAME}
 
