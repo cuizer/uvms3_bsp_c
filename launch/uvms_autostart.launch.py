@@ -324,10 +324,10 @@ def generate_launch_description():
     # Normal BSP node
     # ==========================================================================
 
-    sys_monitor = Node(
+    bsp_monitor = Node(
         package="bsp",
-        executable="sys_monitor_node",
-        name="sys_monitor_node",
+        executable="bsp_monitor_node",
+        name="bsp_monitor_node",
         output="screen",
     )
 
@@ -500,7 +500,7 @@ def generate_launch_description():
         bsp_comm,
         bsp_remote,
         bsp_motion,
-        sys_monitor,
+        bsp_monitor,
 
         # ----------------------------------------------------------------------
         # Startup manager
