@@ -1,6 +1,6 @@
 /**
  * @file bsp_motioncontrol_node.cpp
- * @brief BSP层运动控制节点 —— 6-DOF 动力学前馈 + PID 反馈控制
+ * @brief BSP层运动控制节点 —— 6-DOF FF+PID+DOB 闭环控制 (控制律/分配自 bsp_py 移植)
  *
  * ## 输入 (Subscriptions)
  *   - /hal/modecontrol    (HalModeControl):     模式控制命令
@@ -22,22 +22,27 @@
  *   - /hal/servo/tail_cmd  (Float64MultiArray):  [框架] 尾舵指令
  *   - /hal/servo/wing_cmd  (Float64MultiArray):  [框架] 翼舵指令
  *
- * ## 控制算法
- *   τ_des = τ_ff + τ_pid              (1) 期望合力/力矩 = 前馈 + 反馈
- *   u     = T⁺ · τ_des                (2) 控制分配: 伪逆映射到各推进器
- *
- *   前馈 τ_ff 补偿稳态水动力阻尼与浮力:
- *     F_x_ff = D_x_lin·vx + D_x_quad·vx·|vx|
- *     F_y_ff = D_y_lin·vy + D_y_quad·vy·|vy|
- *     F_z_ff = buoyancy_trim
- *     M_z_ff = D_yaw_lin·r + D_yaw_quad·r·|r|
- *
- *   反馈 τ_pid 为六通道离散PID, 带积分抗饱和与微分低通滤波:
- *     e[k] = x_des[k] - x_real[k]
- *     P[k] = Kp · e[k]
- *     I[k] = I[k-1] + Ki · e[k] · dt   (带限幅)
- *     D[k] = Kd · (e[k] - e[k-1]) / dt  (一阶低通滤波)
- *
+ * ## 控制算法 (逐自由度, 自 bsp_py dof_controller.py 移植)
+ *   τ_i = τ_FF,i + τ_PID,i − d̂_i,  按 controller_mode 分级:
+ *     1=纯PID, 2=FF+PID (默认), 3=FF+PID+DOB
+ *   前馈: surge/sway 用 ν_des 线性+二次阻尼前馈; depth 用浮力配平
+ *         buoyancy_trim; 角通道前馈为 0
+ *   PID: 六通道离散PID, 积分抗饱和 + D项一阶低通 (pid_deriv_alpha)
+ *   DOB: d̂ = α·d̂₋ + (1−α)·[τ_prev − m_eff·ν̇ − d_eff·ν], α=exp(−带宽·dt)
+ *         ν̇ 后向差分; 角通道 ν = p/q/r (姿态差分 + J2_inv 估计)
+ *   分配: τ (N/N·m) → u (N), 逐次截断阻尼最小二乘, |u_k|≤thrust_limits[k],
+ *         死区后按各推上限换算百分比发布
+ *   门控 (D5): IMU/DVL/深度计任一无效或推进器故障 → 零推力全停;
+ *         通道 enable=false 时该通道 PID/FF/DOB 全部冻结
+ *   参数现状: thrust_limits/mass_eff/damp_eff/alloc_matrix 为 python 移植占位值,
+ *         以 ⚠ 标注, 待实测/模型替换后再做水池整定
+ * ## 在线调参 (v0.2, 无需重新编译/重启)
+ *   全部控制参数在运行期可通过 `ros2 param set /bsp_motioncontrol_node <参数> <值>`
+ *   实时修改并即时生效: PID 增益/限幅、前馈系数、分配矩阵 alloc_matrix、分配阻尼
+ *   alloc_lambda、微分滤波系数 pid_deriv_alpha、各通道使能开关、推力/舵机限幅、
+ *   看门狗超时 cmd_timeout_s、控制频率 control_rate_hz、模式命令值等。
+ *   非法值/非法组合会被整体拒绝并返回原因, 不会产生半生效状态;
+ *   话题类参数 (mode_topic/remote_topic) 在下次 configure 时生效。
  * @author BSP Motion Control Team
  * @date   2026-06-22
  */
@@ -60,6 +65,10 @@
  #include "rclcpp_lifecycle/lifecycle_publisher.hpp"
  #include "lifecycle_msgs/msg/state.hpp"
  #include "std_msgs/msg/float64_multi_array.hpp"
+ #include "rcl_interfaces/msg/set_parameters_result.hpp"
+ #include "rclcpp/node_interfaces/node_parameters_interface.hpp"
+ #include "rclcpp/parameter.hpp"
+ #include <initializer_list>
  
  #include "hal/msg/hal_inertialnavi.hpp"
  #include "hal/msg/hal_dvl.hpp"
@@ -166,6 +175,67 @@
          prev_filtered_deriv = 0.0;
      }
  };
+
+ // ============================================================================
+ // 扰动观测器 DOB (移植自 bsp_py dof_controller.py)
+ //   d̂ = α·d̂₋ + (1−α)·[τ_prev − m_eff·ν̇ − d_eff·ν],   α = exp(−L·dt)
+ // 补偿未建模扰动: 海流/浮力差/缆力/模型误差。L=0 时禁用。
+ // ============================================================================
+ struct DobController {
+     double bandwidth = 0.0;   // 观测器带宽 L (rad/s), 0 = 禁用
+     double mass_eff  = 1.0;   // 等效质量/惯量 (kg 或 kg·m²)
+     double damp_eff  = 0.0;   // 等效线性阻尼
+
+     double d_hat       = 0.0; // 扰动估计
+     double alpha       = 0.0; // 低通系数 α
+     double prev_nu     = 0.0; // 上一拍速度 (ν̇ 后向差分)
+     bool   has_prev_nu = false;
+     bool   alpha_valid = false;
+
+     void configure(double bw, double mass, double damp)
+     {
+         bandwidth   = bw;
+         mass_eff    = mass;
+         damp_eff    = damp;
+         alpha_valid = false;
+     }
+
+     void reset()
+     {
+         d_hat       = 0.0;
+         alpha       = 0.0;
+         prev_nu     = 0.0;
+         has_prev_nu = false;
+         alpha_valid = false;
+     }
+
+     /** 控制频率变化: α 与 ν̇ 差分基准失效 */
+     void on_dt_change()
+     {
+         alpha_valid = false;
+         has_prev_nu = false;
+     }
+
+     /** 一步更新, 返回当前扰动估计 (禁用/无效 dt 返回 0) */
+     double update(double nu, double tau_prev, double dt)
+     {
+         if (bandwidth <= 0.0 || dt <= 0.0) return 0.0;
+         if (!alpha_valid) {
+             alpha = std::exp(-bandwidth * dt);
+             alpha_valid = true;
+         }
+         const double nu_dot = has_prev_nu ? (nu - prev_nu) / dt : 0.0;
+         prev_nu     = nu;
+         has_prev_nu = true;
+         const double raw_d = tau_prev - mass_eff * nu_dot - damp_eff * nu;
+         d_hat = alpha * d_hat + (1.0 - alpha) * raw_d;
+         return d_hat;
+     }
+ };
+
+ // python 自由度顺序 (surge,sway,depth,yaw,pitch,roll) → wrench 行 (Fx,Fy,Fz,Mx,My,Mz)
+ static constexpr int DOF_ROW[6] = {0, 1, 2, 5, 4, 3};
+
  
  // ============================================================================
  // 六自由度目标指令
@@ -235,6 +305,33 @@
      {
          // ----- 控制周期参数 -----
          this->declare_parameter<double>("control_rate_hz", 50.0);
+
+         // ----- 在线调参: 全局算法系数 (原硬编码, 现开放为运行期参数) -----
+         this->declare_parameter<double>("pid_deriv_alpha", 0.7);
+         this->declare_parameter<double>("alloc_lambda", 0.01);
+         this->declare_parameter<int>("controller_mode", 2);   // 1=纯PID 2=FF+PID 3=FF+PID+DOB
+         this->declare_parameter<double>("deadzone_pct", 3.0); // 分配死区 (% of u_max)
+         this->declare_parameter<std::vector<double>>("thrust_limits",
+             {441.0, 69.0, 69.0, 69.0, 69.0, 69.0});  // 各推推力上限 (N), ⚠ python 占位
+         // DOB 系数 (python 命名; ⚠ 数值占位待实测, roll 量级疑似异常)
+         this->declare_parameter<double>("surge.dob_bandwidth", 3.0);
+         this->declare_parameter<double>("surge.mass_eff", 275.0);
+         this->declare_parameter<double>("surge.damp_eff", 50.0);
+         this->declare_parameter<double>("sway.dob_bandwidth", 3.0);
+         this->declare_parameter<double>("sway.mass_eff", 526.8);
+         this->declare_parameter<double>("sway.damp_eff", 125.0);
+         this->declare_parameter<double>("depth.dob_bandwidth", 2.0);
+         this->declare_parameter<double>("depth.mass_eff", 526.8);
+         this->declare_parameter<double>("depth.damp_eff", 125.0);
+         this->declare_parameter<double>("yaw.dob_bandwidth", 2.0);
+         this->declare_parameter<double>("yaw.mass_eff", 472.9);
+         this->declare_parameter<double>("yaw.damp_eff", 47.2);
+         this->declare_parameter<double>("pitch.dob_bandwidth", 1.5);
+         this->declare_parameter<double>("pitch.mass_eff", 472.0);
+         this->declare_parameter<double>("pitch.damp_eff", 47.2);
+         this->declare_parameter<double>("roll.dob_bandwidth", 1.5);
+         this->declare_parameter<double>("roll.mass_eff", 4.345);   // ⚠ 量级存疑, 待实测
+         this->declare_parameter<double>("roll.damp_eff", 0.434);   // ⚠ 量级存疑, 待实测
  
          // ----- PID 参数 (每自由度独立) -----
          // Surge (vx)
@@ -334,6 +431,12 @@
          this->declare_parameter<int64_t>("mode_pid_disable_value", 2);
          this->declare_parameter<int64_t>("mode_keyboard_enable_value", 3);
          this->declare_parameter<int64_t>("mode_keyboard_disable_value", 4);
+
+         // ----- 在线调参: 注册参数变更回调 (ros2 param set 即时生效) -----
+         param_cb_handle_ = this->add_on_set_parameters_callback(
+             [this](const std::vector<rclcpp::Parameter> & params) {
+                 return on_parameter_set(params);
+             });
      }
  
      // ========================================================================
@@ -420,7 +523,7 @@
  
          try {
              load_parameters();
-             reset_all_pid();
+             reset_all_controllers();
              clear_target_state();
              clear_vehicle_state();
              active_ = true;
@@ -431,7 +534,7 @@
              active_ = false;
              clear_target_state();
              clear_vehicle_state();
-             reset_all_pid();
+             reset_all_controllers();
              thruster_cmd_pub_->on_deactivate();
              tail_cmd_pub_->on_deactivate();
              wing_cmd_pub_->on_deactivate();
@@ -451,7 +554,7 @@
          if (was_enabled) {
              send_zero_thrust();
          } else {
-             reset_all_pid();
+             reset_all_controllers();
          }
          thruster_cmd_pub_->on_deactivate();
          tail_cmd_pub_->on_deactivate();
@@ -508,13 +611,58 @@
      // ========================================================================
      void load_parameters() {
          // PID
+         // 微分滤波系数 & 分配阻尼 (运行期可通过参数在线修改, 此处加载启动值)
+         pid_deriv_alpha_ = this->get_parameter("pid_deriv_alpha").as_double();
+         alloc_lambda_    = this->get_parameter("alloc_lambda").as_double();
+         if (!std::isfinite(pid_deriv_alpha_) || pid_deriv_alpha_ < 0.0 ||
+             pid_deriv_alpha_ >= 1.0) {
+             throw std::invalid_argument(
+                 "pid_deriv_alpha must be finite and in [0, 1)");
+         }
+         if (!std::isfinite(alloc_lambda_) || alloc_lambda_ <= 0.0 ||
+             alloc_lambda_ > 1000.0) {
+             throw std::invalid_argument(
+                 "alloc_lambda must be finite and in (0, 1000]");
+         }
+
+         // 控制律模式 / 死区 / 推力上限 / DOB 系数 (python 版移植)
+         controller_mode_ = static_cast<int>(this->get_parameter("controller_mode").as_int());
+         deadzone_pct_ = this->get_parameter("deadzone_pct").as_double();
+         if (controller_mode_ < 1 || controller_mode_ > 3 ||
+             !std::isfinite(deadzone_pct_) || deadzone_pct_ < 0.0 ||
+             deadzone_pct_ > 100.0) {
+             throw std::invalid_argument(
+                 "controller_mode must be 1/2/3 and deadzone_pct in [0,100]");
+         }
+         const std::vector<double> tlim = this->get_parameter("thrust_limits").as_double_array();
+         if (tlim.size() != 6U || !std::all_of(tlim.begin(), tlim.end(),
+                 [](double x) { return std::isfinite(x) && x > 0.0 && x <= 1e6; })) {
+             throw std::invalid_argument("thrust_limits must be 6 values in (0,1e6]");
+         }
+         for (size_t i = 0; i < 6U; ++i) thrust_limits_[i] = tlim[i];
+         static const std::array<std::string, 6> DOF_PARAM = {
+             "surge", "sway", "depth", "yaw", "pitch", "roll"};
+         for (size_t i = 0; i < 6U; ++i) {
+             const std::string pfx = DOF_PARAM[i] + ".";
+             const double bw = this->get_parameter(pfx + "dob_bandwidth").as_double();
+             const double me = this->get_parameter(pfx + "mass_eff").as_double();
+             const double de = this->get_parameter(pfx + "damp_eff").as_double();
+             if (!std::isfinite(bw) || bw < 0.0 || bw > 1000.0 ||
+                 !std::isfinite(me) || me <= 0.0 ||
+                 !std::isfinite(de) || de < 0.0) {
+                 throw std::invalid_argument(
+                     DOF_PARAM[i] + " DOB coefficients invalid");
+             }
+             dob_[DOF_ROW[i]].configure(bw, me, de);
+         }
+
          auto load_pid = [this](const std::string & prefix, PidController & pid) {
              pid.kp      = this->get_parameter(prefix + ".kp").as_double();
              pid.ki      = this->get_parameter(prefix + ".ki").as_double();
              pid.kd      = this->get_parameter(prefix + ".kd").as_double();
              pid.max_i   = this->get_parameter(prefix + ".max_i").as_double();
              pid.max_out = this->get_parameter(prefix + ".max_out").as_double();
-             pid.alpha   = 0.7;  // 固定微分滤波系数
+             pid.alpha   = pid_deriv_alpha_;  // 微分滤波系数 (在线可调)
              if (!std::isfinite(pid.kp) || !std::isfinite(pid.ki) ||
                  !std::isfinite(pid.kd) || !std::isfinite(pid.max_i) ||
                  !std::isfinite(pid.max_out) || pid.max_i < 0.0 ||
@@ -630,10 +778,13 @@
              en_ff_, en_pid_, en_servo_);
      }
  
-     void reset_all_pid() {
+     void reset_all_controllers() {
          pid_vx_.reset();   pid_vy_.reset();
          pid_depth_.reset(); pid_yaw_.reset();
          pid_pitch_.reset(); pid_roll_.reset();
+        for (DobController & d : dob_) d.reset();
+        tau_prev_real_.fill(0.0);
+        reset_attitude_estimator();
      }
  
      // ========================================================================
@@ -715,8 +866,8 @@
                  }
              }
              if (mode_changed) {
-                 reset_all_pid();
-                 yaw_target_initialized_ = false;
+                 reset_all_controllers();
+                 reset_attitude_estimator();
                  RCLCPP_INFO(get_logger(),
                      "[MC] PID mode enabled (cmd=%u)",
                      static_cast<unsigned>(cmd));
@@ -757,10 +908,8 @@
              last_cmd_time_ = std::chrono::steady_clock::now();
          }
          if (was_enabled) {
-             reset_all_pid();
-             yaw_target_initialized_ = false;
-             prev_yaw_target_ = 0.0;
-             filtered_yaw_rate_ = 0.0;
+             reset_all_controllers();
+             reset_attitude_estimator();
          }
          return was_enabled;
      }
@@ -803,9 +952,13 @@
      // ========================================================================
      // 主控制循环 (定时器回调)
      // ========================================================================
-     void control_loop() {
+     // ============================================================================
+     // 主控制循环 (定时器回调)
+     // ============================================================================
+     void control_loop()
+     {
          if (!active_) return;
- 
+
          // 1. 获取最新目标 & 状态 (快照)
          TargetSetpoint target;
          VehicleState   state;
@@ -817,7 +970,7 @@
              last_cmd = last_cmd_time_;
              pid_mode_enabled = pid_mode_enabled_;
          }
-         // PID 未开启时完全不发布，避免与键盘遥控节点争抢 /hal/thruster/cmd。
+         // PID 未开启时完全不发布, 避免与键盘遥控节点争抢 /hal/thruster/cmd。
          if (!pid_mode_enabled) {
              return;
          }
@@ -825,7 +978,7 @@
              std::lock_guard<std::mutex> lock2(state_mutex_);
              state = state_;
          }
- 
+
          // 2. 看门狗: 超时未收到指令 → 零推力安全停机
          const double dt_cmd = std::chrono::duration<double>(
              std::chrono::steady_clock::now() - last_cmd).count();
@@ -837,214 +990,278 @@
              send_zero_thrust();
              return;
          }
- 
-         // 3. 传感器有效性检查
-         if (!state.imu_valid || !state.depth_valid) {
+
+         // 3. 传感器 & 执行器健康检查
+         //    D5 决策: DVL 失效直接全停; 推进器故障直接全停 (与 bsp_py 一致)。
+         const bool any_aux_fault = std::any_of(state.aux_fault.begin(),
+                                                state.aux_fault.end(),
+                                                [](bool f) { return f; });
+         if (!state.imu_valid || !state.dvl_valid || !state.depth_valid) {
              RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                 "[MC] 传感器数据无效 (imu=%d depth=%d) → 零推力停机",
-                 state.imu_valid, state.depth_valid);
+                 "[MC] 传感器数据无效 (imu=%d dvl=%d depth=%d) → 零推力停机",
+                 state.imu_valid, state.dvl_valid, state.depth_valid);
              send_zero_thrust();
              return;
          }
- 
-         // 4. 计算期望合力/力矩
-         Wrench tau_ff{};
-         Wrench tau_pid{};
- 
-         if (en_ff_)  tau_ff  = compute_feedforward(target, state);
-         if (en_pid_) tau_pid = compute_pid(target, state);
- 
-         Wrench tau_des;
-         tau_des.Fx = tau_ff.Fx + tau_pid.Fx;
-         tau_des.Fy = tau_ff.Fy + tau_pid.Fy;
-         tau_des.Fz = tau_ff.Fz + tau_pid.Fz;
-         tau_des.Mx = tau_ff.Mx + tau_pid.Mx;
-         tau_des.My = tau_ff.My + tau_pid.My;
-         tau_des.Mz = tau_ff.Mz + tau_pid.Mz;
- 
-         // 5. 控制分配: wrench → thruster %
-         auto thruster_cmds = allocate_thrust(tau_des);
- 
-         // 6. 发布推进器指令
-         auto cmd_msg = std_msgs::msg::Float64MultiArray();
-         cmd_msg.data.resize(6);  // [主推0x301, 辅推ID2, ID3, ID4, ID5, ID6]
-         cmd_msg.data[0] = thruster_cmds[0];             // 推进器1: 主推 CAN ID 0x301
-         for (size_t i = 0; i < 5; ++i) {
-             cmd_msg.data[i + 1] = thruster_cmds[i + 1]; // 推进器2~6: 辅推电调 ID2~ID6
+         if (state.main_fault || any_aux_fault) {
+             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                 "[MC] 推进器故障 (main=%d aux=%d) → 零推力停机",
+                 state.main_fault, static_cast<int>(any_aux_fault));
+             send_zero_thrust();
+             return;
          }
+
+         // 4. 估计体坐标角速率 p/q/r (供角通道 DOB, 移植自 bsp_py)
+         const std::array<double, 3> pqr =
+             estimate_body_rates(state.yaw, state.pitch, state.roll);
+
+         // 5. 期望合力/力矩 (逐自由度 FF+PID+DOB)
+         const Wrench tau_des =
+             compute_control_wrench(target, state, pqr[0], pqr[1], pqr[2]);
+
+         // 6. 推力分配 (N 单位, 逐次截断 DLS)
+         const std::array<double, 6> u_cmd = allocate_thrust(tau_des);
+
+         // 7. 死区 → 实际施加 wrench (喂 DOB) → N 换算百分比发布
+         std::array<double, 6> u_eff{};
+         std::array<double, 6> thruster_pct{};
+         for (size_t k = 0; k < 6U; ++k) {
+             u_eff[k] = (std::abs(u_cmd[k]) < deadzone_pct_ * 0.01 * thrust_limits_[k])
+                            ? 0.0 : u_cmd[k];
+             thruster_pct[k] = std::clamp(u_eff[k] / thrust_limits_[k] * 100.0,
+                                          thrust_min_pct_, thrust_max_pct_);
+         }
+         tau_prev_real_ = apply_allocation(u_eff);
+
+         // 8. 发布推进器指令 (data[0]=主推 0x301, data[1..5]=辅推 ID2..ID6)
+         auto cmd_msg = std_msgs::msg::Float64MultiArray();
+         cmd_msg.data.assign(thruster_pct.begin(), thruster_pct.end());
          thruster_cmd_pub_->publish(cmd_msg);
- 
-         // 7. [框架] 舵机指令 (不使能时发布零位)
+
+         // 9. [框架] 舵机指令 (不使能时发布零位)
          publish_servo_commands(target, state);
- 
-         // 8. 缓存当前推力指令 (用于状态反馈)
+
+         // 10. 缓存当前推力指令百分比 (供状态反馈)
          {
              std::lock_guard<std::mutex> lock(state_mutex_);
-             state_.main_thrust_pct = thruster_cmds[0];
+             state_.main_thrust_pct = thruster_pct[0];
              for (size_t i = 0; i < 5; ++i) {
-                 state_.aux_thrust_pct[i] = thruster_cmds[i + 1];
+                 state_.aux_thrust_pct[i] = thruster_pct[i + 1];
              }
          }
      }
- 
-     // ========================================================================
-     // 前馈计算 (动力学模型补偿)
-     // ========================================================================
-     Wrench compute_feedforward(const TargetSetpoint & target, const VehicleState & /*state*/) {
-         Wrench ff;
- 
-         // -- 纵荡方向: 线性 + 二次阻尼补偿 --
-         double vx_des = en_surge_ ? target.vx : 0.0;
-         ff.Fx = ff_drag_lin_x_ * vx_des
-               + ff_drag_quad_x_ * vx_des * std::abs(vx_des);
- 
-         // -- 横荡方向: 线性 + 二次阻尼补偿 --
-         double vy_des = en_sway_ ? target.vy : 0.0;
-         ff.Fy = ff_drag_lin_y_ * vy_des
-               + ff_drag_quad_y_ * vy_des * std::abs(vy_des);
- 
-         // -- 垂荡方向: 仅浮力微调配平 (深度由PID闭环控制) --
-         ff.Fz = ff_buoyancy_;
- 
-         // -- 横摇/纵倾: 无前馈 (PID单独抑制) --
-         ff.Mx = 0.0;
-         ff.My = 0.0;
- 
-         // -- 转艏方向: 线性 + 二次阻尼补偿 --
-         // 目标角速度取自近期姿态差分 (稳定状态下接近0, 前馈只在大机动时起作用)
-         double yaw_rate_des = estimate_yaw_rate_from_target(target);
-         ff.Mz = ff_drag_lin_yaw_ * yaw_rate_des
-               + ff_drag_quad_yaw_ * yaw_rate_des * std::abs(yaw_rate_des);
- 
-         return ff;
+
+     // ============================================================================
+     // 体坐标角速率估计 (欧拉角差分 + J2_inv, 移植自 bsp_py _estimate_body_angular_rates)
+     // ============================================================================
+     std::array<double, 3> estimate_body_rates(double yaw, double pitch, double roll)
+     {
+         const auto now = std::chrono::steady_clock::now();
+         if (!att_initialized_) {
+             att_initialized_ = true;
+             prev_yaw_ = yaw;
+             prev_pitch_ = pitch;
+             prev_roll_ = roll;
+             prev_att_time_ = now;
+             return {0.0, 0.0, 0.0};
+         }
+         const double dt = std::chrono::duration<double>(now - prev_att_time_).count();
+         if (dt <= 0.0) {
+             return {0.0, 0.0, 0.0};
+         }
+         const double dphi   = wrap_angle(roll - prev_roll_) / dt;
+         const double dtheta = wrap_angle(pitch - prev_pitch_) / dt;
+         const double dpsi   = wrap_angle(yaw - prev_yaw_) / dt;
+         const double st = std::sin(pitch), ct = std::cos(pitch);
+         const double cp = std::cos(roll),   sp = std::sin(roll);
+         const double p = dphi - st * dpsi;
+         const double q = cp * dtheta + sp * ct * dpsi;
+         const double r = -sp * dtheta + cp * ct * dpsi;
+         prev_yaw_ = yaw;
+         prev_pitch_ = pitch;
+         prev_roll_ = roll;
+         prev_att_time_ = now;
+         return {p, q, r};
      }
- 
-     // ========================================================================
-     // PID反馈计算 (六通道独立)
-     // ========================================================================
-     Wrench compute_pid(const TargetSetpoint & target, const VehicleState & state) {
-         double dt = control_period_s_;
-         Wrench pid;
- 
-         // --- Surge (vx) ---
-         if (en_surge_) {
-             double err = target.vx - state.vx;
-             pid.Fx = pid_vx_.update(err, dt);
-         }
- 
-         // --- Sway (vy) ---
-         if (en_sway_) {
-             double err = target.vy - state.vy;
-             pid.Fy = pid_vy_.update(err, dt);
-         }
- 
-         // --- Depth (位置式, 仅使用深度反馈) ---
-         if (en_depth_) {
-             double err = target.depth - state.depth;
-             pid.Fz = pid_depth_.update(err, dt);
-         }
- 
-         // --- Yaw (艏向, 角度误差带 wrapping) ---
-         if (en_yaw_) {
-             double err = wrap_angle(target.yaw - state.yaw);
-             pid.Mz = pid_yaw_.update(err, dt);
-         }
- 
-         // --- Pitch (纵倾锁定为0) ---
-         if (en_pitch_) {
-             double err = wrap_angle(0.0 - state.pitch);
-             pid.My = pid_pitch_.update(err, dt);
-         }
- 
-         // --- Roll (横摇锁定为0) ---
-         if (en_roll_) {
-             double err = wrap_angle(0.0 - state.roll);
-             pid.Mx = pid_roll_.update(err, dt);
-         }
- 
-         return pid;
+
+     /** @brief 姿态估计器复位 (随控制器复位调用) */
+     void reset_attitude_estimator()
+     {
+         att_initialized_ = false;
+         prev_yaw_ = 0.0;
+         prev_pitch_ = 0.0;
+         prev_roll_ = 0.0;
      }
- 
-     // ========================================================================
-     // 控制分配: 加权伪逆 T⁺ 将期望 wrench 映射到推进器指令
-     //
-     //   τ = T·u   (6×6 分配矩阵 × 6维推力向量 = 6维合力)
-     //   u = T⁺·τ  (Moore-Penrose 伪逆)
-     //
-     // 使用阻尼最小二乘 (Damped Least Squares) 以增强数值稳定性:
-     //   T⁺ = T^T · (T · T^T + λ²·I)^{-1}
-     // ========================================================================
-     std::array<double, 6> allocate_thrust(const Wrench & tau) {
-         constexpr int N_DOF  = 6;
-         constexpr int N_THR  = 6;  // 1主推 + 5辅推
-         const double lambda  = 0.01;  // 阻尼因子 (抑制奇异值附近的异常放大)
- 
-         // 1. 组装 τ 向量
-         double tau_arr[N_DOF] = {tau.Fx, tau.Fy, tau.Fz, tau.Mx, tau.My, tau.Mz};
- 
-         // 2. 计算 T·T^T + λ²I  (6×6 对称矩阵)
-         double M[N_DOF][N_DOF] = {};
-         for (int i = 0; i < N_DOF; ++i) {
-             for (int j = 0; j < N_DOF; ++j) {
-                 double sum = 0.0;
-                 for (int k = 0; k < N_THR; ++k) {
-                     sum += alloc_vec_[i * N_THR + k] * alloc_vec_[j * N_THR + k];
-                 }
-                 M[i][j] = sum;
-                 if (i == j) M[i][j] += lambda * lambda;
+
+     // ============================================================================
+     // 逐自由度 FF+PID+DOB 控制律 (移植自 bsp_py dof_controller.py)
+     //   τ = τ_FF + τ_PID − d̂   行序: [Fx Fy Fz Mx My Mz]
+     // ============================================================================
+     Wrench compute_control_wrench(const TargetSetpoint & target,
+                                   const VehicleState & state,
+                                   double p, double q, double r)
+     {
+         Wrench tau{};
+         const int    mode = controller_mode_;
+         const double dt   = control_period_s_;
+
+         auto pid_ptr = [this](int row) -> PidController* {
+             switch (row) {
+                 case 0: return &pid_vx_;
+                 case 1: return &pid_vy_;
+                 case 2: return &pid_depth_;
+                 case 3: return &pid_roll_;
+                 case 4: return &pid_pitch_;
+                 default: return &pid_yaw_;
              }
-         }
- 
-         // 3. Cholesky 分解 M = L·L^T (M 对称正定)
-         double L[N_DOF][N_DOF] = {};
-         for (int i = 0; i < N_DOF; ++i) {
-             for (int j = 0; j <= i; ++j) {
-                 double sum = M[i][j];
-                 for (int k = 0; k < j; ++k) {
-                     sum -= L[i][k] * L[j][k];
-                 }
-                 if (i == j) {
-                     L[i][j] = std::sqrt(std::max(sum, 1e-12));
-                 } else {
-                     L[i][j] = sum / L[j][j];
-                 }
+         };
+
+         // 单自由度一步: 冻结通道整体不更新 (PID/FF/DOB 状态全保留)
+         auto run_law = [&](int row, bool enabled, double error,
+                            double nu_act, double tau_prev, double tau_ff) -> double {
+             if (!enabled) return 0.0;
+             double out = 0.0;
+             if (en_pid_) {
+                 out += pid_ptr(row)->update(error, dt);
              }
-         }
- 
-         // 4. 前代/回代: 解 M·y = τ → y
-         double y[N_DOF] = {};
-         // 前代: L·z = τ
-         double z[N_DOF] = {};
-         for (int i = 0; i < N_DOF; ++i) {
-             double sum = tau_arr[i];
-             for (int j = 0; j < i; ++j) sum -= L[i][j] * z[j];
-             z[i] = sum / L[i][i];
-         }
-         // 回代: L^T·y = z
-         for (int i = N_DOF - 1; i >= 0; --i) {
-             double sum = z[i];
-             for (int j = i + 1; j < N_DOF; ++j) sum -= L[j][i] * y[j];
-             y[i] = sum / L[i][i];
-         }
- 
-         // 5. u = T^T · y
-         std::array<double, N_THR> u{};
-         for (int k = 0; k < N_THR; ++k) {
+             if (en_ff_ && mode >= 2) {
+                 out += tau_ff;
+             }
+             if (mode >= 3) {
+                 out -= dob_[row].update(nu_act, tau_prev, dt);
+             }
+             return out;
+         };
+
+         // surge (Fx): 速度环, ν_des 阻尼前馈
+         tau.Fx = run_law(0, en_surge_, target.vx - state.vx,
+                          state.vx, tau_prev_real_[0],
+                          ff_drag_lin_x_ * target.vx +
+                              ff_drag_quad_x_ * target.vx * std::abs(target.vx));
+         // sway (Fy): 速度环
+         tau.Fy = run_law(1, en_sway_, target.vy - state.vy,
+                          state.vy, tau_prev_real_[1],
+                          ff_drag_lin_y_ * target.vy +
+                              ff_drag_quad_y_ * target.vy * std::abs(target.vy));
+         // depth (Fz): 位置环, 前馈 = 浮力配平, DOB 观测 ν=vz
+         tau.Fz = run_law(2, en_depth_, target.depth - state.depth,
+                          state.vz, tau_prev_real_[2], ff_buoyancy_);
+         // roll / pitch / yaw: 角度锁定/跟踪, 前馈 0, DOB 观测 p / q / r
+         tau.Mx = run_law(3, en_roll_, wrap_angle(0.0 - state.roll),
+                          p, tau_prev_real_[3], 0.0);
+         tau.My = run_law(4, en_pitch_, wrap_angle(0.0 - state.pitch),
+                          q, tau_prev_real_[4], 0.0);
+         tau.Mz = run_law(5, en_yaw_, wrap_angle(target.yaw - state.yaw),
+                          r, tau_prev_real_[5], 0.0);
+         return tau;
+     }
+
+     /** @brief 分配后实际施加广义力 T·u (N), 供 DOB 下一拍反馈 */
+     std::array<double, 6> apply_allocation(const std::array<double, 6> & u)
+     {
+         std::array<double, 6> tau{};
+         for (int i = 0; i < 6; ++i) {
              double sum = 0.0;
-             for (int i = 0; i < N_DOF; ++i) {
-                 sum += alloc_vec_[i * N_THR + k] * y[i];
+             for (int k = 0; k < 6; ++k) {
+                 sum += alloc_vec_[i * 6 + k] * u[k];
              }
-             u[k] = sum;
+             tau[i] = sum;
          }
- 
-         // 6. 输出限幅
-         for (int k = 0; k < N_THR; ++k) {
-             u[k] = std::clamp(u[k], thrust_min_pct_, thrust_max_pct_);
+         return tau;
+     }
+
+     // ============================================================================
+     // 控制分配: 逐次截断阻尼最小二乘 (移植自 bsp_py thrust_alloc.py)
+     //   约束 |u_k| ≤ thrust_limits_[k] (N); 饱和推钉死后对残余 wrench 重分配
+     // ============================================================================
+     std::array<double, 6> allocate_thrust(const Wrench & tau)
+     {
+         const std::array<double, 6> tau_arr = {
+             tau.Fx, tau.Fy, tau.Fz, tau.Mx, tau.My, tau.Mz};
+         std::array<double, 6> u{};
+         std::array<bool, 6>   pinned{};
+         const double lambda = (std::isfinite(alloc_lambda_) && alloc_lambda_ > 1e-9)
+                                   ? alloc_lambda_ : 0.01;
+
+         for (int iter = 0; iter < 6; ++iter) {
+             // 未饱和推进器 (free 列)
+             int n_free = 0;
+             int free_idx[6];
+             for (int k = 0; k < 6; ++k) {
+                 if (!pinned[k]) free_idx[n_free++] = k;
+             }
+             if (n_free == 0) break;
+
+             // 残余目标: 减去已钉死列贡献
+             std::array<double, 6> tau_rem = tau_arr;
+             for (int k = 0; k < 6; ++k) {
+                 if (!pinned[k]) continue;
+                 for (int i = 0; i < 6; ++i) {
+                     tau_rem[i] -= alloc_vec_[i * 6 + k] * u[k];
+                 }
+             }
+
+             // M = T_f·T_fᵀ + λ²I (6×6), u_f = T_fᵀ·M⁻¹·τ_rem
+             double M[6][6] = {};
+             for (int i = 0; i < 6; ++i) {
+                 for (int j = 0; j < 6; ++j) {
+                     double sum = 0.0;
+                     for (int n = 0; n < n_free; ++n) {
+                         const int k = free_idx[n];
+                         sum += alloc_vec_[i * 6 + k] * alloc_vec_[j * 6 + k];
+                     }
+                     M[i][j] = sum;
+                     if (i == j) M[i][j] += lambda * lambda;
+                 }
+             }
+             double L[6][6] = {};
+             for (int i = 0; i < 6; ++i) {
+                 for (int j = 0; j <= i; ++j) {
+                     double sum = M[i][j];
+                     for (int k = 0; k < j; ++k) sum -= L[i][k] * L[j][k];
+                     if (i == j) L[i][j] = std::sqrt(std::max(sum, 1e-12));
+                     else        L[i][j] = sum / L[j][j];
+                 }
+             }
+             double y[6] = {};
+             double z[6] = {};
+             for (int i = 0; i < 6; ++i) {
+                 double sum = tau_rem[i];
+                 for (int j = 0; j < i; ++j) sum -= L[i][j] * z[j];
+                 z[i] = sum / L[i][i];
+             }
+             for (int i = 5; i >= 0; --i) {
+                 double sum = z[i];
+                 for (int j = i + 1; j < 6; ++j) sum -= L[j][i] * y[j];
+                 y[i] = sum / L[i][i];
+             }
+
+             bool any_sat = false;
+             for (int j = 0; j < 6; ++j) {
+                 if (pinned[j]) continue;
+                 double val = 0.0;
+                 for (int i = 0; i < 6; ++i) {
+                     val += alloc_vec_[i * 6 + j] * y[i];
+                 }
+                 const double lim = thrust_limits_[j];
+                 if (val > lim) {
+                     u[j] = lim; pinned[j] = true; any_sat = true;
+                 } else if (val < -lim) {
+                     u[j] = -lim; pinned[j] = true; any_sat = true;
+                 } else {
+                     u[j] = val;
+                 }
+             }
+             if (!any_sat) break;
          }
- 
+
+         for (int k = 0; k < 6; ++k) {
+             u[k] = std::clamp(u[k], -thrust_limits_[k], thrust_limits_[k]);
+         }
          return u;
      }
- 
+
+
      // ========================================================================
      // [框架] 舵机指令发布
      // ========================================================================
@@ -1071,13 +1288,13 @@
      // ========================================================================
      void send_zero_thrust() {
          if (!thruster_cmd_pub_ || !thruster_cmd_pub_->is_activated()) {
-             reset_all_pid();
+             reset_all_controllers();
              return;
          }
          auto zero_msg = std_msgs::msg::Float64MultiArray();
          zero_msg.data = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};  // 1主推 + 5辅推
          thruster_cmd_pub_->publish(zero_msg);
-         reset_all_pid();
+         reset_all_controllers();
      }
  
      void clear_target_state() {
@@ -1086,9 +1303,7 @@
              target_ = TargetSetpoint{};
              last_cmd_time_ = std::chrono::steady_clock::now();
          }
-         yaw_target_initialized_ = false;
-         prev_yaw_target_ = 0.0;
-         filtered_yaw_rate_ = 0.0;
+         reset_attitude_estimator();
      }
  
      void clear_vehicle_state() {
@@ -1096,21 +1311,406 @@
          state_ = VehicleState{};
      }
  
-     /** @brief 基于目标艏向序列差分估计期望转艏角速度 */
-     double estimate_yaw_rate_from_target(const TargetSetpoint & target) {
-         if (!yaw_target_initialized_) {
-             yaw_target_initialized_ = true;
-             prev_yaw_target_ = target.yaw;
-             filtered_yaw_rate_ = 0.0;
-             return 0.0;
-         }
-         const double rate = wrap_angle(target.yaw - prev_yaw_target_) / control_period_s_;
-         prev_yaw_target_ = target.yaw;
-         // 低通滤波抑制阶跃噪声
-         filtered_yaw_rate_ = 0.6 * filtered_yaw_rate_ + 0.4 * rate;
-         return filtered_yaw_rate_;
-     }
  
+     // ========================================================================
+     // 在线调参: 参数变更回调
+     // 运行期 `ros2 param set` / `ros2 param load` 即时生效, 无需重新编译/重启。
+     // 两阶段提交: 阶段1 校验全部变更 (任一非法则整批拒绝), 阶段2 统一应用。
+     // 说明: 本节点在单线程 executor 中运行, 参数回调与订阅/定时器回调互斥,
+     //       因此直接修改成员变量无数据竞争。
+     // ========================================================================
+
+     /** @brief 拆分 PID 参数名, 形如 pid_vx.kp → dof="vx", key="kp". */
+     static bool split_pid_param_name(const std::string & name,
+                                      std::string & dof, std::string & key)
+     {
+         static const std::array<std::string, 6> DOFS = {
+             "vx", "vy", "depth", "yaw", "pitch", "roll"};
+         static const std::array<std::string, 5> KEYS = {
+             "kp", "ki", "kd", "max_i", "max_out"};
+         for (const std::string & d : DOFS) {
+             const std::string prefix = "pid_" + d + ".";
+             if (name.rfind(prefix, 0) != 0) continue;
+             const std::string k = name.substr(prefix.size());
+             if (std::find(KEYS.begin(), KEYS.end(), k) == KEYS.end()) return false;
+             dof = d;
+             key = k;
+             return true;
+         }
+         return false;
+     }
+
+     /** @brief 按自由度名取对应 PID 控制器. */
+     PidController * pid_of_dof(const std::string & dof)
+     {
+         if (dof == "vx")    return &pid_vx_;
+         if (dof == "vy")    return &pid_vy_;
+         if (dof == "depth") return &pid_depth_;
+         if (dof == "yaw")   return &pid_yaw_;
+         if (dof == "pitch") return &pid_pitch_;
+         return &pid_roll_;
+     }
+
+     /** @brief 是否为前馈参数名. */
+     static bool is_ff_param_name(const std::string & name)
+     {
+         static const std::array<std::string, 9> FF_NAMES = {
+             "ff.drag_linear_x",     "ff.drag_quadratic_x",
+             "ff.drag_linear_y",     "ff.drag_quadratic_y",
+             "ff.drag_linear_z",     "ff.drag_quadratic_z",
+             "ff.drag_linear_yaw",   "ff.drag_quadratic_yaw",
+             "ff.buoyancy_trim"};
+         return std::find(FF_NAMES.begin(), FF_NAMES.end(), name) != FF_NAMES.end();
+     }
+
+     /** @brief 拆分 DOB 参数名 (python 命名如 surge.dob_bandwidth) → wrench 行 & 键 */
+     static bool split_dob_param_name(const std::string & name, int & row, int & key)
+     {
+         static const std::array<std::string, 6> DOFS = {
+             "surge", "sway", "depth", "yaw", "pitch", "roll"};
+         static const std::array<std::string, 3> KEYS = {
+             "dob_bandwidth", "mass_eff", "damp_eff"};
+         for (size_t i = 0; i < DOFS.size(); ++i) {
+             const std::string prefix = DOFS[i] + ".";
+             if (name.rfind(prefix, 0) != 0) continue;
+             for (size_t k = 0; k < KEYS.size(); ++k) {
+                 if (name == prefix + KEYS[k]) {
+                     row = DOF_ROW[i];
+                     key = static_cast<int>(k);
+                     return true;
+                 }
+             }
+         }
+         return false;
+     }
+
+
+     /** @brief 数值参数读取: 兼容 double 与 integer 两种类型. */
+     static double param_to_double(const rclcpp::Parameter & p)
+     {
+         try { return p.as_double(); } catch (const std::exception &) { }
+         try { return static_cast<double>(p.as_int()); } catch (const std::exception &) { }
+         throw std::invalid_argument("参数必须是数值类型 (double/integer)");
+     }
+
+     /** @brief 整数参数读取: integer 优先, 兼容整数值的 double. */
+     static int64_t param_to_int(const rclcpp::Parameter & p)
+     {
+         try { return p.as_int(); } catch (const std::exception &) { }
+         try {
+             const double v = p.as_double();
+             if (std::isfinite(v) && v == std::floor(v)) {
+                 return static_cast<int64_t>(v);
+             }
+         } catch (const std::exception &) { }
+         throw std::invalid_argument("参数必须是整数类型");
+     }
+
+     /** @brief 应用单个前馈参数. */
+     void set_ff_param(const std::string & name, double v)
+     {
+         if      (name == "ff.drag_linear_x")     ff_drag_lin_x_     = v;
+         else if (name == "ff.drag_quadratic_x")  ff_drag_quad_x_    = v;
+         else if (name == "ff.drag_linear_y")     ff_drag_lin_y_     = v;
+         else if (name == "ff.drag_quadratic_y")  ff_drag_quad_y_    = v;
+         else if (name == "ff.drag_linear_z")     ff_drag_lin_z_     = v;
+         else if (name == "ff.drag_quadratic_z")  ff_drag_quad_z_    = v;
+         else if (name == "ff.drag_linear_yaw")   ff_drag_lin_yaw_   = v;
+         else if (name == "ff.drag_quadratic_yaw") ff_drag_quad_yaw_ = v;
+         else if (name == "ff.buoyancy_trim")     ff_buoyancy_       = v;
+     }
+
+     /** @brief 应用单个 PID 增益/限幅参数. */
+     void set_pid_param_value(const std::string & dof, const std::string & key, double v)
+     {
+         PidController * c = pid_of_dof(dof);
+         if      (key == "kp")      c->kp      = v;
+         else if (key == "ki")      c->ki      = v;
+         else if (key == "kd")      c->kd      = v;
+         else if (key == "max_i")   c->max_i   = v;
+         else if (key == "max_out") c->max_out = v;
+     }
+
+     /** @brief 控制频率变化后重建控制定时器. */
+     void restart_control_timer()
+     {
+         // 控制频率变化: DOB 的 α 与 ν̇ 差分基准需重建
+         for (DobController & d : dob_) d.on_dt_change();
+         if (!control_timer_) return;  // configure 前无需处理, configure 时按最新频率创建
+         control_timer_->cancel();
+         control_timer_.reset();
+         const double rate = 1.0 / control_period_s_;
+         const int period_ms = std::max(1, static_cast<int>(1000.0 / rate));
+         control_timer_ = this->create_wall_timer(
+             std::chrono::milliseconds(period_ms),
+             std::bind(&BspMotionControlNode::control_loop, this));
+         RCLCPP_INFO(get_logger(), "[MC] 控制频率已在线更新: %.1f Hz", rate);
+     }
+
+     /** @brief ROS2 参数回调: 运行期在线调参入口. */
+     rcl_interfaces::msg::SetParametersResult
+     on_parameter_set(const std::vector<rclcpp::Parameter> & params)
+     {
+         const auto reject = [](const std::string & reason) {
+             rcl_interfaces::msg::SetParametersResult r;
+             r.successful = false;
+             r.reason     = reason;
+             return r;
+         };
+
+         // ---- 阶段 1: 校验全部变更 (任一非法 → 整批拒绝, 不产生半生效状态) ----
+         double new_alpha       = pid_deriv_alpha_;
+         double new_lambda      = alloc_lambda_;
+         double new_rate        = 1.0 / control_period_s_;
+         double new_cmd_timeout = cmd_timeout_s_;
+         double new_thrust_min  = thrust_min_pct_;
+         double new_thrust_max  = thrust_max_pct_;
+         bool   thrust_touched  = false;
+         bool   modes_touched   = false;
+         std::array<int64_t, 4> new_modes = {
+             pid_enable_value_, pid_disable_value_,
+             keyboard_enable_value_, keyboard_disable_value_};
+         std::vector<rclcpp::Parameter> accepted;
+         accepted.reserve(params.size());
+
+         for (const rclcpp::Parameter & p : params) {
+             const std::string & n = p.get_name();
+             try {
+                 int dob_row = -1;
+                 int dob_key = -1;
+                 const bool is_dob = split_dob_param_name(n, dob_row, dob_key);
+                 if (n == "pid_deriv_alpha" || n == "alloc_lambda") {
+                     const double v = param_to_double(p);
+                     if (n == "pid_deriv_alpha") {
+                         if (!std::isfinite(v) || v < 0.0 || v >= 1.0) {
+                             return reject(n + ": 需满足 [0, 1)");
+                         }
+                         new_alpha = v;
+                     } else {
+                         if (!std::isfinite(v) || v <= 0.0 || v > 1000.0) {
+                             return reject(n + ": 需满足 (0, 1000]");
+                         }
+                         new_lambda = v;
+                     }
+                 } else if (n == "alloc_matrix") {
+                     const std::vector<double> v = p.as_double_array();
+                     if (v.size() != 36U) {
+                         return reject(n + ": 必须恰好 36 个元素");
+                     }
+                     if (!std::all_of(v.begin(), v.end(),
+                             [](double x) { return std::isfinite(x); })) {
+                         return reject(n + ": 元素必须全部为有限值");
+                     }
+                 } else if (n == "thrust_min_pct" || n == "thrust_max_pct") {
+                     const double v = param_to_double(p);
+                     if (!std::isfinite(v) || v < -100.0 || v > 100.0) {
+                         return reject(n + ": 需在 [-100, 100] 内");
+                     }
+                     if (n == "thrust_min_pct") new_thrust_min = v;
+                     else                       new_thrust_max = v;
+                     thrust_touched = true;
+                 } else if (n == "servo_max_deg") {
+                     const double v = param_to_double(p);
+                     if (!std::isfinite(v) || v <= 0.0 || v > 180.0) {
+                         return reject(n + ": 需满足 (0, 180]");
+                     }
+                 } else if (n == "cmd_timeout_s") {
+                     new_cmd_timeout = param_to_double(p);
+                     if (!std::isfinite(new_cmd_timeout) || new_cmd_timeout <= 0.0) {
+                         return reject(n + ": 必须为正数");
+                     }
+                 } else if (n == "control_rate_hz") {
+                     new_rate = param_to_double(p);
+                     if (!std::isfinite(new_rate) || new_rate <= 0.0 ||
+                         new_rate > 1000.0) {
+                         return reject(n + ": 需在 (0, 1000] 内");
+                     }
+                 } else if (is_dob) {
+                     const double v = param_to_double(p);
+                     if (!std::isfinite(v)) {
+                         return reject(n + ": 必须为有限值");
+                     }
+                     if (dob_key == 0 && (v < 0.0 || v > 1000.0)) {
+                         return reject(n + ": dob_bandwidth 需在 [0, 1000] 内");
+                     }
+                     if (dob_key == 1 && v <= 0.0) {
+                         return reject(n + ": mass_eff 必须 > 0");
+                     }
+                     if (dob_key == 2 && v < 0.0) {
+                         return reject(n + ": damp_eff 必须 >= 0");
+                     }
+                 } else if (n == "controller_mode") {
+                     const int64_t v = param_to_int(p);
+                     if (v < 1 || v > 3) {
+                         return reject(n + ": 需为 1/2/3");
+                     }
+                 } else if (n == "deadzone_pct") {
+                     const double v = param_to_double(p);
+                     if (!std::isfinite(v) || v < 0.0 || v > 100.0) {
+                         return reject(n + ": 需在 [0, 100] 内");
+                     }
+                 } else if (n == "thrust_limits") {
+                     const std::vector<double> v = p.as_double_array();
+                     if (v.size() != 6U) {
+                         return reject(n + ": 必须恰好 6 个元素");
+                     }
+                     if (!std::all_of(v.begin(), v.end(),
+                             [](double x) { return std::isfinite(x) && x > 0.0 &&
+                                                   x <= 1e6; })) {
+                         return reject(n + ": 元素需在 (0, 1e6] 内且有限");
+                     }
+                 } else if (n == "mode_pid_enable_value" ||
+                            n == "mode_pid_disable_value" ||
+                            n == "mode_keyboard_enable_value" ||
+                            n == "mode_keyboard_disable_value") {
+                     const int64_t v = param_to_int(p);
+                     if (v < 0 || v > 255) return reject(n + ": 需在 [0, 255] 内");
+                     const size_t slot = (n == "mode_pid_enable_value")      ? 0U :
+                                         (n == "mode_pid_disable_value")     ? 1U :
+                                         (n == "mode_keyboard_enable_value") ? 2U : 3U;
+                     new_modes[slot] = v;
+                     modes_touched = true;
+                 } else if (is_ff_param_name(n)) {
+                     if (!std::isfinite(param_to_double(p))) {
+                         return reject(n + ": 必须为有限值");
+                     }
+                 } else if (n.rfind("enable_", 0) == 0) {
+                     (void)p.as_bool();  // 仅做类型检查
+                 } else if (n == "use_sim_time") {
+                     try { (void)p.as_bool(); } catch (const std::exception &) {
+                         return reject(n + ": 需要 bool 类型");
+                     }
+                 } else if (n == "mode_topic" || n == "remote_topic") {
+                     (void)p.as_string();  // 接受, 下次 configure 生效
+                 } else {
+                     std::string dof, key;
+                     if (!split_pid_param_name(n, dof, key)) {
+                         return reject("参数 " + n + " 不支持在线修改");
+                     }
+                     const double v = param_to_double(p);
+                     if (!std::isfinite(v)) return reject(n + ": 必须为有限值");
+                     if (key == "max_i" && v < 0.0) {
+                         return reject(n + ": 必须 >= 0");
+                     }
+                     if (key == "max_out" && v <= 0.0) {
+                         return reject(n + ": 必须 > 0");
+                     }
+                 }
+             } catch (const std::exception & e) {
+                 return reject(n + ": " + e.what());
+             }
+             accepted.push_back(p);
+         }
+
+         // 交叉约束 (成对/成组参数)
+         if (thrust_touched && new_thrust_min >= new_thrust_max) {
+             return reject("thrust_min_pct 必须小于 thrust_max_pct");
+         }
+         if (modes_touched) {
+             std::array<int64_t, 4> sorted_modes = new_modes;
+             std::sort(sorted_modes.begin(), sorted_modes.end());
+             if (std::adjacent_find(sorted_modes.begin(), sorted_modes.end()) !=
+                 sorted_modes.end()) {
+                 return reject("四个模式命令值必须互不相同");
+             }
+         }
+
+         // ---- 阶段 2: 应用 ----
+         for (const rclcpp::Parameter & p : accepted) {
+             const std::string & n = p.get_name();
+             try {
+                 int dob_row = -1;
+                 int dob_key = -1;
+                 const bool is_dob = split_dob_param_name(n, dob_row, dob_key);
+                 if (n == "pid_deriv_alpha") {
+                     pid_deriv_alpha_ = new_alpha;
+                     for (PidController * c : {&pid_vx_, &pid_vy_, &pid_depth_,
+                                               &pid_yaw_, &pid_pitch_, &pid_roll_}) {
+                         c->alpha = pid_deriv_alpha_;
+                     }
+                 } else if (n == "alloc_lambda") {
+                     alloc_lambda_ = new_lambda;
+                 } else if (n == "alloc_matrix") {
+                     alloc_vec_ = p.as_double_array();
+                 } else if (n == "thrust_min_pct") {
+                     thrust_min_pct_ = new_thrust_min;
+                 } else if (n == "thrust_max_pct") {
+                     thrust_max_pct_ = new_thrust_max;
+                 } else if (n == "servo_max_deg") {
+                     servo_max_deg_ = param_to_double(p);
+                 } else if (n == "cmd_timeout_s") {
+                     cmd_timeout_s_ = new_cmd_timeout;
+                 } else if (n == "control_rate_hz") {
+                     control_period_s_ = 1.0 / new_rate;
+                 } else if (n == "mode_pid_enable_value") {
+                     pid_enable_value_ = static_cast<uint8_t>(new_modes[0]);
+                 } else if (n == "mode_pid_disable_value") {
+                     pid_disable_value_ = static_cast<uint8_t>(new_modes[1]);
+                 } else if (n == "mode_keyboard_enable_value") {
+                     keyboard_enable_value_ = static_cast<uint8_t>(new_modes[2]);
+                 } else if (n == "mode_keyboard_disable_value") {
+                     keyboard_disable_value_ = static_cast<uint8_t>(new_modes[3]);
+                 } else if (is_ff_param_name(n)) {
+                     set_ff_param(n, param_to_double(p));
+                 } else if (n == "enable_surge")  { en_surge_  = p.as_bool(); }
+                 else if (n == "enable_sway")     { en_sway_   = p.as_bool(); }
+                 else if (n == "enable_depth")    { en_depth_  = p.as_bool(); }
+                 else if (n == "enable_yaw")      { en_yaw_    = p.as_bool(); }
+                 else if (n == "enable_pitch")    { en_pitch_  = p.as_bool(); }
+                 else if (n == "enable_roll")     { en_roll_   = p.as_bool(); }
+                 else if (n == "enable_ff")       { en_ff_     = p.as_bool(); }
+                 else if (n == "enable_pid")      { en_pid_    = p.as_bool(); }
+                 else if (n == "enable_servo")    { en_servo_  = p.as_bool(); }
+                 else if (is_dob) {
+                     const double v = param_to_double(p);
+                     if (dob_key == 0)      dob_[dob_row].bandwidth = v;
+                     else if (dob_key == 1) dob_[dob_row].mass_eff  = v;
+                     else                   dob_[dob_row].damp_eff  = v;
+                     dob_[dob_row].reset();  // 模型系数变更: 清观测器状态避免突变
+                 } else if (n == "controller_mode") {
+                     controller_mode_ = static_cast<int>(param_to_int(p));
+                 } else if (n == "deadzone_pct") {
+                     deadzone_pct_ = param_to_double(p);
+                 } else if (n == "thrust_limits") {
+                     const std::vector<double> v = p.as_double_array();
+                     for (size_t i = 0; i < 6U; ++i) thrust_limits_[i] = v[i];
+                 }
+                 else if (n == "use_sim_time") {
+                     // ROS2 通用参数: 接受但不参与运动控制 (仅便于整组 param load)
+                 }
+                 else if (n == "mode_topic" || n == "remote_topic") {
+                     RCLCPP_WARN(get_logger(),
+                         "[MC] 在线调参: %s 将在下次 configure 时生效", n.c_str());
+                 } else {
+                     std::string dof, key;
+                     if (split_pid_param_name(n, dof, key)) {
+                         set_pid_param_value(dof, key, param_to_double(p));
+                     }
+                 }
+             } catch (const std::exception & e) {
+                 RCLCPP_ERROR(get_logger(), "[MC] 在线调参: %s 应用失败: %s",
+                              n.c_str(), e.what());
+                 continue;
+             }
+             RCLCPP_INFO(get_logger(), "[MC] 在线调参: %s = %s",
+                         n.c_str(), p.value_to_string().c_str());
+         }
+
+         // 控制频率变化时重建定时器 (配置完成后才需要)
+         if (std::any_of(accepted.begin(), accepted.end(),
+                 [](const rclcpp::Parameter & p) {
+                     return p.get_name() == "control_rate_hz";
+                 })) {
+             restart_control_timer();
+         }
+
+         rcl_interfaces::msg::SetParametersResult result;
+         result.successful = true;
+         result.reason = "ok";
+         return result;
+     }
+
+
      // ========================================================================
      // 成员变量
      // ========================================================================
@@ -1122,9 +1722,6 @@
      TargetSetpoint    target_;
      std::chrono::steady_clock::time_point last_cmd_time_{};
      std::mutex        cmd_mutex_;
-     bool yaw_target_initialized_ = false;
-     double prev_yaw_target_ = 0.0;
-     double filtered_yaw_rate_ = 0.0;
  
      // -- PID 控制器 (6通道) --
      PidController pid_vx_;
@@ -1152,6 +1749,23 @@
      double thrust_max_pct_ = 100.0;
      double thrust_min_pct_ = -100.0;
      double control_period_s_ = 0.02;
+     double servo_max_deg_   = 45.0;
+     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_handle_{};
+     double pid_deriv_alpha_ = 0.7;   // D 项一阶低通滤波系数 (原固定 0.7)
+     double alloc_lambda_    = 0.01;  // 分配阻尼因子 (原固定 0.01)
+     // -- 控制律 (python 版移植) --
+     int controller_mode_ = 2;        // 1=纯PID 2=FF+PID 3=FF+PID+DOB
+     double deadzone_pct_ = 3.0;      // 分配死区 (% of u_max)
+     std::array<double, 6> thrust_limits_{441.0, 69.0, 69.0, 69.0, 69.0, 69.0};
+                                        // 各推推力上限 (N) ⚠ 占位待实测
+     std::array<DobController, 6> dob_{};          // DOB 状态 (行序 Fx..Mz)
+     std::array<double, 6> tau_prev_real_{};       // 上一拍实际 wrench T·u (N)
+     // -- 角速率估计 (姿态差分) --
+     bool att_initialized_ = false;
+     double prev_yaw_ = 0.0;
+     double prev_pitch_ = 0.0;
+     double prev_roll_ = 0.0;
+     std::chrono::steady_clock::time_point prev_att_time_{};
  
      // -- 使能开关 --
      bool en_surge_  = true;
