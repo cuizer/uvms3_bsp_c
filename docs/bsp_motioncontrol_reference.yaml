@@ -1,0 +1,136 @@
+# =============================================================================
+# bsp_motioncontrol_node 参数配置 (C++ 版, 启动基线)
+# =============================================================================
+# 控制律 (自 bsp_py dof_controller.py 移植): τ = τ_FF + τ_PID − d̂ (逐自由度)
+#   controller_mode: 1=纯PID  2=FF+PID  3=FF+PID+DOB   (实机按 1→2→3 投用)
+# 指令来源 (保留 C++): /hal/remotecontrol 摇杆 + /hal/modecontrol 1/2/3/4 仲裁
+# 用法:
+#   - 本文件由 uvms_autostart.launch.py 启动 bsp_motioncontrol_node 时加载;
+#   - 运行期在线调参: `ros2 param set /bsp_motioncontrol_node <参数> <值>` 即时生效;
+#   - 调参存盘: `ros2 param dump /bsp_motioncontrol_node --output-dir ~/auv_tuning`,
+#     把最终值写回本文件后下次开机自动生效。
+#
+# 注意:
+#   - double 参数必须带小数点 (如 250.0), 整数会被 ROS2 参数服务拒绝;
+#   - 模式命令值 (mode_*_value) 必须互不相同且在 [0,255];
+#   - ⚠ = 从 bsp_py/python 侧移植的占位数值, 待实测/模型替换
+#     (roll 的 mass_eff/damp_eff 量级明显异常, 首查; 详见 docs/motion_control_design.md §9)
+# =============================================================================
+
+bsp_motioncontrol_node:
+  ros__parameters:
+
+    # ---- 运行 ----
+    control_rate_hz: 50.0          # 控制频率 (Hz), 运行期修改会重建定时器
+    cmd_timeout_s: 1.0             # 遥控/指令看门狗超时 (s), 超时输出零推力
+    controller_mode: 2             # 1=纯PID 2=FF+PID 3=FF+PID+DOB
+    pid_deriv_alpha: 0.7           # PID D 项一阶低通滤波系数 [0,1)
+    alloc_lambda: 0.01             # 推力分配阻尼因子 (DLS), (0,1000]
+    deadzone_pct: 3.0              # 分配死区 (% of 各推 u_max)
+
+    # ---- 话题 (下次 configure 生效) ----
+    mode_topic: /hal/modecontrol
+    remote_topic: /hal/remotecontrol
+
+    # ---- 模式命令值 (必须互不相同) ----
+    mode_pid_enable_value: 1
+    mode_pid_disable_value: 2
+    mode_keyboard_enable_value: 3
+    mode_keyboard_disable_value: 4
+
+    # ---- PID (surge/sway 为速度环, depth 为位置环, yaw/pitch/roll 为角度环) ----
+    pid_vx.kp: 200.0
+    pid_vx.ki: 20.0
+    pid_vx.kd: 10.0
+    pid_vx.max_i: 50.0
+    pid_vx.max_out: 300.0
+
+    pid_vy.kp: 200.0
+    pid_vy.ki: 20.0
+    pid_vy.kd: 10.0
+    pid_vy.max_i: 50.0
+    pid_vy.max_out: 300.0
+
+    pid_depth.kp: 300.0
+    pid_depth.ki: 30.0
+    pid_depth.kd: 50.0
+    pid_depth.max_i: 80.0
+    pid_depth.max_out: 400.0
+
+    pid_yaw.kp: 400.0
+    pid_yaw.ki: 10.0
+    pid_yaw.kd: 80.0
+    pid_yaw.max_i: 40.0
+    pid_yaw.max_out: 500.0
+
+    pid_pitch.kp: 150.0
+    pid_pitch.ki: 5.0
+    pid_pitch.kd: 30.0
+    pid_pitch.max_i: 20.0
+    pid_pitch.max_out: 150.0
+
+    pid_roll.kp: 150.0
+    pid_roll.ki: 5.0
+    pid_roll.kd: 30.0
+    pid_roll.max_i: 20.0
+    pid_roll.max_out: 150.0
+
+    # ---- 前馈 (当前仅 surge/sway 用 ν_des 阻尼前馈, depth 用浮力配平) ----
+    ff.drag_linear_x: 50.0
+    ff.drag_quadratic_x: 120.0
+    ff.drag_linear_y: 60.0
+    ff.drag_quadratic_y: 140.0
+    ff.drag_linear_z: 80.0          # 新控制律下不使用 (depth 前馈=buoyancy_trim)
+    ff.drag_quadratic_z: 180.0
+    ff.drag_linear_yaw: 30.0        # 新控制律下不使用 (角通道 nu_des=0)
+    ff.drag_quadratic_yaw: 80.0
+    ff.buoyancy_trim: 0.0           # depth 通道静态前馈 (N, 向下为正)
+
+    # ---- DOB (自 bsp_py 移植; ⚠ 数值占位, 待 G3/G4 实测替换) ----
+    # bandwidth=0 时该通道 DOB 禁用
+    surge.dob_bandwidth: 3.0        # L (rad/s)
+    surge.mass_eff: 275.0           # 等效质量 (kg)  ⚠
+    surge.damp_eff: 50.0            # 等效线性阻尼 ⚠
+    sway.dob_bandwidth: 3.0
+    sway.mass_eff: 526.8            # ⚠
+    sway.damp_eff: 125.0            # ⚠
+    depth.dob_bandwidth: 2.0
+    depth.mass_eff: 526.8           # ⚠
+    depth.damp_eff: 125.0           # ⚠
+    yaw.dob_bandwidth: 2.0
+    yaw.mass_eff: 472.9             # 转动惯量 (kg·m²)  ⚠
+    yaw.damp_eff: 47.2              # ⚠
+    pitch.dob_bandwidth: 1.5
+    pitch.mass_eff: 472.0           # ⚠
+    pitch.damp_eff: 47.2            # ⚠
+    roll.dob_bandwidth: 1.5
+    roll.mass_eff: 4.345            # ⚠⚠ 量级疑似异常 (pitch/yaw 约 470), 优先核对
+    roll.damp_eff: 0.434            # ⚠⚠ 同上, 疑似笔误
+
+    # ---- 推力分配 ----
+    # 列顺序: [主推 0x301, 辅推 ID2..ID6]
+    # 行顺序: [Fx, Fy, Fz, Mx, My, Mz]    τ = T · u  (u 单位 N)
+    alloc_matrix: [1.0, 0.0, 0.0, 0.0, 0.5, 0.5,
+                   0.0, 0.0, 0.0, 1.0, 1.0, 0.0,
+                   0.0, 1.0, 1.0, 0.0, 0.0, 0.0,
+                   0.0, 0.1, -0.1, 0.0, 0.0, 0.0,
+                   0.0, 0.3, 0.3, 0.0, 0.0, 0.0,
+                   0.0, 0.0, 0.0, 0.2, -0.2, 0.1]
+    # 各推进器推力上限 (N), 与 alloc_matrix 列同序 ⚠ 占位, 待 G2 实测
+    thrust_limits: [441.0, 69.0, 69.0, 69.0, 69.0, 69.0]
+
+    # ---- 输出百分比限幅 (兜底) ----
+    thrust_max_pct: 100.0
+    thrust_min_pct: -100.0
+    servo_max_deg: 45.0
+
+    # ---- 通道使能 (false 时该通道完全冻结: PID/FF/DOB 均不更新) ----
+    enable_surge: true
+    enable_sway: true
+    enable_depth: true
+    enable_yaw: true
+    enable_pitch: true
+    enable_roll: true
+    enable_ff: true
+    enable_pid: true
+    enable_servo: false        # 舵机分配未启用, 当前周期发布零位
