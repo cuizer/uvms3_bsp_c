@@ -376,11 +376,20 @@ def generate_launch_description():
             ),
 
             # --------------------------------------------------------------
-            # Initial group: always activate these two first
+            # Initial group: always attempt these two first
             # --------------------------------------------------------------
             "initial_lifecycle_nodes": [
                 "/hal_battery_node",
                 "/bsp_comm_node",
+            ],
+
+            # --------------------------------------------------------------
+            # Initial gate: only battery feedback is required before power
+            # rail groups are allowed to progress. bsp_comm is still attempted
+            # first, but a bsp_comm failure must not block unrelated HAL nodes.
+            # --------------------------------------------------------------
+            "initial_required_lifecycle_nodes": [
+                "/hal_battery_node",
             ],
 
             # --------------------------------------------------------------

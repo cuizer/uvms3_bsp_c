@@ -44,6 +44,11 @@ public:
     declare_parameter<std::vector<std::string>>(
       "initial_lifecycle_nodes", {"/hal_battery_node", "/bsp_comm_node"});
 
+    // These nodes gate entry into power-feedback-driven bringup. bsp_comm is still
+    // started in the initial group, but it must not block unrelated rail groups.
+    declare_parameter<std::vector<std::string>>(
+      "initial_required_lifecycle_nodes", {"/hal_battery_node"});
+
     // 48 V dependent software/control group.
     declare_parameter<std::vector<std::string>>(
       "rail_48v_lifecycle_nodes",
@@ -87,6 +92,8 @@ public:
       std::chrono::milliseconds(retry_delay_ms < 0 ? 0 : retry_delay_ms);
 
     initial_nodes_ = get_parameter("initial_lifecycle_nodes").as_string_array();
+    initial_required_nodes_ =
+      get_parameter("initial_required_lifecycle_nodes").as_string_array();
     rail_48v_nodes_ = get_parameter("rail_48v_lifecycle_nodes").as_string_array();
     rail_12v_nodes_ = get_parameter("rail_12v_lifecycle_nodes").as_string_array();
     rail_24v_nodes_ = get_parameter("rail_24v_lifecycle_nodes").as_string_array();
@@ -122,10 +129,14 @@ private:
   struct GroupRuntime
   {
     bool completed{false};
-    bool configure_phase_done{false};
     std::optional<Clock::time_point> power_on_since;
-    std::optional<Clock::time_point> activate_not_before;
-    Clock::time_point next_retry_at{Clock::time_point::min()};
+    struct NodeRuntime
+    {
+      bool completed{false};
+      std::optional<Clock::time_point> activate_not_before;
+      Clock::time_point next_retry_at{Clock::time_point::min()};
+    };
+    std::map<std::string, NodeRuntime> nodes;
   };
 
   std::chrono::milliseconds seconds_parameter(const std::string & name) const
@@ -175,37 +186,43 @@ private:
     RCLCPP_INFO(get_logger(), "UVMS startup manager started.");
 
     // ------------------------------------------------------------------------
-    // Phase 1: battery + bsp_comm must be the first lifecycle nodes to become active.
-    // The same state-safe configure -> delay -> activate logic is used here.
+    // Battery + bsp_comm are always attempted first. A bsp_comm failure must not
+    // block later rail groups forever; with power feedback enabled, hal_battery
+    // is the required initial node because it provides rail switch states.
     // ------------------------------------------------------------------------
     GroupRuntime initial_runtime;
     initial_runtime.power_on_since = Clock::now();
 
-    while (rclcpp::ok() && !stop_requested() && !initial_runtime.completed) {
-      process_group(
-        "initial", initial_nodes_, true, initial_runtime,
-        std::chrono::milliseconds(0));
-      std::this_thread::sleep_for(100ms);
-    }
-
-    if (!initial_runtime.completed) {
-      return;
-    }
-
-    RCLCPP_INFO(
-      get_logger(),
-      "Initial lifecycle group is active. Entering power-feedback-driven bringup.");
-
     // ------------------------------------------------------------------------
-    // Phase 2: no fixed rail ordering.
+    // Power-dependent groups: no fixed rail ordering.
     // Each group has its own state machine and reacts only to its own power gate.
     // ------------------------------------------------------------------------
     GroupRuntime rail_48v_runtime;
     GroupRuntime rail_12v_runtime;
     GroupRuntime rail_24v_runtime;
     GroupRuntime thruster_runtime;
+    bool power_groups_enabled = false;
 
     while (rclcpp::ok() && !stop_requested()) {
+      process_group(
+        "initial", initial_nodes_, true, initial_runtime,
+        std::chrono::milliseconds(0));
+
+      if (!power_groups_enabled &&
+        (initial_runtime.completed || !require_power_feedback_ ||
+        required_initial_nodes_active()))
+      {
+        power_groups_enabled = true;
+        RCLCPP_INFO(
+          get_logger(),
+          "Initial lifecycle gate is ready. Entering power-feedback-driven bringup.");
+      }
+
+      if (!power_groups_enabled) {
+        std::this_thread::sleep_for(100ms);
+        continue;
+      }
+
       bool v48_on = false;
       bool v12_on = false;
       bool v24_on = false;
@@ -254,14 +271,13 @@ private:
     // Power disappeared before activation: restart the power-stable timer.
     // We intentionally do not deactivate an already completed group here.
     if (!power_condition) {
-      if (runtime.power_on_since.has_value() || runtime.configure_phase_done) {
+      if (runtime.power_on_since.has_value() || has_pending_activation(runtime)) {
         RCLCPP_WARN(
           get_logger(), "%s power condition is not ready; pending bringup timer reset.",
           group_name.c_str());
       }
       runtime.power_on_since.reset();
-      runtime.configure_phase_done = false;
-      runtime.activate_not_before.reset();
+      reset_pending_nodes(runtime);
       return;
     }
 
@@ -277,82 +293,72 @@ private:
       return;
     }
 
-    if (now < runtime.next_retry_at) {
-      return;
-    }
-
-    // ----------------------------------------------------------------------
-    // Configure phase.
-    // Every node state is checked immediately before a configure request.
-    // If a test operator has already configured/activated the node, no command
-    // is sent and the manager simply accepts the current valid state.
-    // ----------------------------------------------------------------------
-    if (!runtime.configure_phase_done) {
-      bool all_already_active = true;
-      bool configure_ok = true;
-
-      for (const auto & node_name : nodes) {
-        const auto result = ensure_configured(node_name);
-        if (!result.has_value()) {
-          configure_ok = false;
-          break;
-        }
-        if (!*result) {
-          all_already_active = false;
-        }
-      }
-
-      if (!configure_ok) {
-        runtime.next_retry_at = now + lifecycle_bringup_retry_delay_;
-        return;
-      }
-
-      if (all_already_active) {
-        runtime.completed = true;
-        RCLCPP_INFO(get_logger(), "%s lifecycle group is already active.", group_name.c_str());
-        return;
-      }
-
-      runtime.configure_phase_done = true;
-      runtime.activate_not_before = Clock::now() + configure_to_activate_delay_;
-
-      RCLCPP_INFO(
-        get_logger(),
-        "%s configure phase complete; waiting %ld ms before activate.",
-        group_name.c_str(), static_cast<long>(configure_to_activate_delay_.count()));
-      return;
-    }
-
-    if (!runtime.activate_not_before.has_value() || now < *runtime.activate_not_before) {
-      return;
-    }
-
-    // Power must still be present at activation time.
-    if (!power_condition) {
-      runtime.power_on_since.reset();
-      runtime.configure_phase_done = false;
-      runtime.activate_not_before.reset();
-      return;
-    }
-
-    // ----------------------------------------------------------------------
-    // Activate phase.
-    // State is queried again for every node immediately before activation.
-    // Manual activation during the 5 s wait is therefore detected and skipped.
-    // ----------------------------------------------------------------------
     bool all_active = true;
     for (const auto & node_name : nodes) {
-      const auto result = ensure_activated(node_name);
-      if (!result.has_value()) {
-        all_active = false;
-        break;
+      const auto node = normalize_node_name(node_name);
+      auto & node_runtime = runtime.nodes[node];
+
+      if (node_runtime.completed) {
+        continue;
       }
-      if (!*result) {
-        // Node returned to UNCONFIGURED or another unsupported state.
-        // Re-enter configure phase on the next pass.
+
+      all_active = false;
+
+      if (now < node_runtime.next_retry_at) {
+        continue;
+      }
+
+      if (!node_runtime.activate_not_before.has_value()) {
+        const auto result = ensure_configured(node);
+        if (!result.has_value()) {
+          node_runtime.next_retry_at = Clock::now() + lifecycle_bringup_retry_delay_;
+          continue;
+        }
+
+        if (*result) {
+          node_runtime.completed = true;
+          RCLCPP_INFO(
+            get_logger(), "%s lifecycle node is active: %s",
+            group_name.c_str(), node.c_str());
+          continue;
+        }
+
+        node_runtime.activate_not_before = Clock::now() + configure_to_activate_delay_;
+        RCLCPP_INFO(
+          get_logger(),
+          "%s lifecycle node configured; waiting %ld ms before activate: %s",
+          group_name.c_str(), static_cast<long>(configure_to_activate_delay_.count()),
+          node.c_str());
+        continue;
+      }
+
+      if (now < *node_runtime.activate_not_before) {
+        continue;
+      }
+
+      const auto result = ensure_activated(node);
+      if (!result.has_value()) {
+        node_runtime.next_retry_at = Clock::now() + lifecycle_bringup_retry_delay_;
+        continue;
+      }
+
+      if (*result) {
+        node_runtime.completed = true;
+        RCLCPP_INFO(
+          get_logger(), "%s lifecycle node is active: %s",
+          group_name.c_str(), node.c_str());
+      } else {
+        node_runtime.activate_not_before.reset();
+        node_runtime.next_retry_at = Clock::now() + lifecycle_bringup_retry_delay_;
+      }
+    }
+
+    all_active = true;
+    for (const auto & node_name : nodes) {
+      const auto node = normalize_node_name(node_name);
+      const auto runtime_iter = runtime.nodes.find(node);
+      if (runtime_iter == runtime.nodes.end() || !runtime_iter->second.completed) {
         all_active = false;
-        runtime.configure_phase_done = false;
-        runtime.activate_not_before.reset();
         break;
       }
     }
@@ -360,9 +366,41 @@ private:
     if (all_active) {
       runtime.completed = true;
       RCLCPP_INFO(get_logger(), "%s lifecycle group is active.", group_name.c_str());
-    } else {
-      runtime.next_retry_at = Clock::now() + lifecycle_bringup_retry_delay_;
     }
+  }
+
+  static bool has_pending_activation(const GroupRuntime & runtime)
+  {
+    for (const auto & item : runtime.nodes) {
+      if (!item.second.completed && item.second.activate_not_before.has_value()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static void reset_pending_nodes(GroupRuntime & runtime)
+  {
+    for (auto & item : runtime.nodes) {
+      if (!item.second.completed) {
+        item.second.activate_not_before.reset();
+        item.second.next_retry_at = Clock::time_point::min();
+      }
+    }
+  }
+
+  bool required_initial_nodes_active()
+  {
+    for (const auto & node_name : initial_required_nodes_) {
+      const auto node = normalize_node_name(node_name);
+      const auto state = get_lifecycle_state(node);
+      if (!state.has_value() ||
+        *state != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE)
+      {
+        return false;
+      }
+    }
+    return true;
   }
 
   // Return value:
@@ -552,6 +590,7 @@ private:
   std::chrono::milliseconds lifecycle_bringup_retry_delay_{1000};
 
   std::vector<std::string> initial_nodes_;
+  std::vector<std::string> initial_required_nodes_;
   std::vector<std::string> rail_48v_nodes_;
   std::vector<std::string> rail_12v_nodes_;
   std::vector<std::string> rail_24v_nodes_;
