@@ -3,8 +3,8 @@
 This launch file:
 1. Configures SocketCAN interfaces before ROS 2 hardware nodes start.
 2. Starts lifecycle-capable HAL/BSP nodes in the unconfigured state.
-3. Starts bsp_startupmanager_node, which powers rails and drives lifecycle
-   transitions in the required order.
+3. Starts bsp_startupmanager_node. Battery and BSP communication are activated
+   first; remaining lifecycle groups are activated from actual power feedback.
 """
 
 import os
@@ -195,6 +195,10 @@ def generate_launch_description():
         "lifecycle_bringup_retry_delay_ms"
     )
 
+    configure_to_activate_delay_ms = LaunchConfiguration(
+        "configure_to_activate_delay_ms"
+    )
+
     # --------------------------------------------------------------------------
     # HAL configuration files
     # --------------------------------------------------------------------------
@@ -366,11 +370,25 @@ def generate_launch_description():
                 value_type=int,
             ),
 
+            "configure_to_activate_delay_ms": ParameterValue(
+                configure_to_activate_delay_ms,
+                value_type=int,
+            ),
+
             # --------------------------------------------------------------
-            # Core communication group
+            # Initial group: always activate these two first
             # --------------------------------------------------------------
-            "core_lifecycle_nodes": [
+            "initial_lifecycle_nodes": [
+                "/hal_battery_node",
                 "/bsp_comm_node",
+            ],
+
+            # --------------------------------------------------------------
+            # 48 V group
+            # --------------------------------------------------------------
+            "rail_48v_lifecycle_nodes": [
+                "/bsp_remotecontrol_node",
+                "/bsp_motioncontrol_node",
             ],
 
             # --------------------------------------------------------------
@@ -393,18 +411,10 @@ def generate_launch_description():
             ],
 
             # --------------------------------------------------------------
-            # 72 V group
+            # Thruster group: requires BOTH 72 V and 12 V feedback
             # --------------------------------------------------------------
-            "rail_72v_lifecycle_nodes": [
+            "thruster_lifecycle_nodes": [
                 "/hal_thruster_node",
-            ],
-
-            # --------------------------------------------------------------
-            # BSP control group
-            # --------------------------------------------------------------
-            "bsp_lifecycle_nodes": [
-                "/bsp_remotecontrol_node",
-                "/bsp_motioncontrol_node",
             ],
         }],
     )
@@ -431,7 +441,7 @@ def generate_launch_description():
 
         DeclareLaunchArgument(
             "power_stabilize_ms",
-            default_value="1200",
+            default_value="2000",
         ),
 
         DeclareLaunchArgument(
@@ -442,6 +452,11 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "lifecycle_bringup_retry_delay_ms",
             default_value="1000",
+        ),
+
+        DeclareLaunchArgument(
+            "configure_to_activate_delay_ms",
+            default_value="5000",
         ),
 
         # ----------------------------------------------------------------------
