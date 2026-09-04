@@ -267,12 +267,26 @@ def generate_launch_description():
         output="screen",
     )
 
+    hal_acoustic = LifecycleNode(
+        package="hal",
+        executable="hal_acoustic_node",
+        name="hal_acoustic_node",
+        output="screen",
+    )
+
     hal_cabinmotor = LifecycleNode(
         package="hal",
         executable="hal_cabinmotor_node",
         name="hal_cabinmotor_node",
         output="screen",
         parameters=[cabinmotor_params],
+    )
+
+    hal_servo = LifecycleNode(
+        package="hal",
+        executable="hal_servo_node",
+        name="hal_servo_node",
+        output="screen",
     )
 
     # --------------------------------------------------------------------------
@@ -415,7 +429,9 @@ def generate_launch_description():
             "rail_24v_lifecycle_nodes": [
                 "/hal_dvl_node",
                 "/hal_depthsensor_node",
+                "/hal_acoustic_node",
                 "/hal_cabinmotor_node",
+                "/hal_servo_node",
                 "/hal_antenna_lifecycle_node",
             ],
 
@@ -513,7 +529,9 @@ def generate_launch_description():
         hal_binocamera,
         hal_dvl,
         hal_depthsensor,
+        hal_acoustic,
         hal_cabinmotor,
+        hal_servo,
         hal_antenna,
         hal_thruster,
 

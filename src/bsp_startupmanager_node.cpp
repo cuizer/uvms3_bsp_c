@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "hal/msg/hal_battery.hpp"
+#include "hal/msg/hal_lifecyclestates_control.hpp"
 #include "lifecycle_msgs/msg/state.hpp"
 #include "lifecycle_msgs/msg/transition.hpp"
 #include "lifecycle_msgs/srv/change_state.hpp"
@@ -60,8 +61,8 @@ public:
 
     declare_parameter<std::vector<std::string>>(
       "rail_24v_lifecycle_nodes",
-      {"/hal_dvl_node", "/hal_depthsensor_node", "/hal_cabinmotor_node",
-        "/hal_antenna_lifecycle_node"});
+      {"/hal_dvl_node", "/hal_depthsensor_node", "/hal_acoustic_node",
+        "/hal_cabinmotor_node", "/hal_servo_node", "/hal_antenna_lifecycle_node"});
 
     // Thruster is special: activation gate is 72 V AND 12 V.
     declare_parameter<std::vector<std::string>>(
@@ -103,6 +104,14 @@ public:
       "/hal/battery",
       rclcpp::QoS(10).reliable(),
       std::bind(&BspStartupManagerNode::battery_callback, this, std::placeholders::_1));
+
+    lifecycle_control_sub_ =
+      create_subscription<hal::msg::HalLifecyclestatesControl>(
+      "/bsp/lifecyclestatescontrol",
+      rclcpp::QoS(10).reliable(),
+      std::bind(
+        &BspStartupManagerNode::lifecycle_control_callback, this,
+        std::placeholders::_1));
 
     if (autostart_) {
       startup_timer_ = create_wall_timer(500ms, [this]() {
@@ -157,6 +166,154 @@ private:
   {
     std::lock_guard<std::mutex> lock(battery_mutex_);
     latest_battery_ = *msg;
+  }
+
+  void lifecycle_control_callback(
+    const hal::msg::HalLifecyclestatesControl::SharedPtr msg)
+  {
+    const auto node = lifecycle_node_name(msg->lifecycle_node);
+    if (!node.has_value()) {
+      RCLCPP_WARN(
+        get_logger(), "Ignoring lifecycle control for reserved/unknown node id: %u",
+        static_cast<unsigned>(msg->lifecycle_node));
+      return;
+    }
+
+    switch (msg->states_cmd) {
+      case 1:
+        handle_configure_command(*node);
+        break;
+      case 2:
+        handle_activate_command(*node);
+        break;
+      default:
+        RCLCPP_WARN(
+          get_logger(), "Ignoring unsupported lifecycle states_cmd: %u",
+          static_cast<unsigned>(msg->states_cmd));
+        break;
+    }
+  }
+
+  static std::optional<std::string> lifecycle_node_name(uint8_t lifecycle_node)
+  {
+    switch (lifecycle_node) {
+      case 1:
+        return "/hal_inertialnavi_node";
+      case 2:
+        return "/hal_dvl_node";
+      case 3:
+        return "/hal_depthsensor_node";
+      case 4:
+        return "/hal_acoustic_node";
+      case 5:
+        return "/hal_thruster_node";
+      case 6:
+        return "/hal_servo_node";
+      case 7:
+        return "/hal_antenna_lifecycle_node";
+      case 8:
+        return "/hal_light_sw_pwm_node";
+      default:
+        return std::nullopt;
+    }
+  }
+
+  void handle_configure_command(const std::string & node_name)
+  {
+    std::lock_guard<std::mutex> lock(lifecycle_transition_mutex_);
+    const auto node = normalize_node_name(node_name);
+    const auto state = get_lifecycle_state(node);
+    if (!state.has_value()) {
+      RCLCPP_WARN(get_logger(), "Manual configure skipped; state unavailable: %s", node.c_str());
+      return;
+    }
+
+    if (*state == lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED) {
+      const auto before_configure = get_lifecycle_state(node);
+      if (!before_configure.has_value()) {
+        RCLCPP_WARN(
+          get_logger(), "Manual configure skipped; state recheck failed: %s",
+          node.c_str());
+        return;
+      }
+      if (*before_configure != lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED) {
+        RCLCPP_INFO(
+          get_logger(), "Manual configure skipped; node state changed to %u: %s",
+          static_cast<unsigned>(*before_configure), node.c_str());
+        return;
+      }
+
+      RCLCPP_INFO(get_logger(), "Manual configuring lifecycle node: %s", node.c_str());
+      change_lifecycle_state(node, lifecycle_msgs::msg::Transition::TRANSITION_CONFIGURE);
+      return;
+    }
+
+    if (*state == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) {
+      RCLCPP_INFO(
+        get_logger(), "Manual configure skipped; node is already configured: %s",
+        node.c_str());
+      return;
+    }
+
+    if (*state == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+      RCLCPP_INFO(
+        get_logger(), "Manual configure skipped; node is already active: %s",
+        node.c_str());
+      return;
+    }
+
+    RCLCPP_WARN(
+      get_logger(), "Manual configure skipped; unsupported state %u: %s",
+      static_cast<unsigned>(*state), node.c_str());
+  }
+
+  void handle_activate_command(const std::string & node_name)
+  {
+    std::lock_guard<std::mutex> lock(lifecycle_transition_mutex_);
+    const auto node = normalize_node_name(node_name);
+    const auto state = get_lifecycle_state(node);
+    if (!state.has_value()) {
+      RCLCPP_WARN(get_logger(), "Manual activate skipped; state unavailable: %s", node.c_str());
+      return;
+    }
+
+    if (*state == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) {
+      const auto before_activate = get_lifecycle_state(node);
+      if (!before_activate.has_value()) {
+        RCLCPP_WARN(
+          get_logger(), "Manual activate skipped; state recheck failed: %s",
+          node.c_str());
+        return;
+      }
+      if (*before_activate != lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) {
+        RCLCPP_INFO(
+          get_logger(), "Manual activate skipped; node state changed to %u: %s",
+          static_cast<unsigned>(*before_activate), node.c_str());
+        return;
+      }
+
+      RCLCPP_INFO(get_logger(), "Manual activating lifecycle node: %s", node.c_str());
+      change_lifecycle_state(node, lifecycle_msgs::msg::Transition::TRANSITION_ACTIVATE);
+      return;
+    }
+
+    if (*state == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+      RCLCPP_INFO(
+        get_logger(), "Manual activate skipped; node is already active: %s",
+        node.c_str());
+      return;
+    }
+
+    if (*state == lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED) {
+      RCLCPP_WARN(
+        get_logger(), "Manual activate skipped; node is not configured: %s",
+        node.c_str());
+      return;
+    }
+
+    RCLCPP_WARN(
+      get_logger(), "Manual activate skipped; unsupported state %u: %s",
+      static_cast<unsigned>(*state), node.c_str());
   }
 
   std::optional<hal::msg::HalBattery> latest_battery_msg() const
@@ -409,6 +566,7 @@ private:
   //   nullopt -> operation failed and should be retried later
   std::optional<bool> ensure_configured(const std::string & node_name)
   {
+    std::lock_guard<std::mutex> lock(lifecycle_transition_mutex_);
     const auto node = normalize_node_name(node_name);
 
     for (int attempt = 1; rclcpp::ok() && attempt <= lifecycle_bringup_max_attempts_; ++attempt) {
@@ -468,6 +626,7 @@ private:
   //   nullopt -> service/transition failure, retry later
   std::optional<bool> ensure_activated(const std::string & node_name)
   {
+    std::lock_guard<std::mutex> lock(lifecycle_transition_mutex_);
     const auto node = normalize_node_name(node_name);
 
     for (int attempt = 1; rclcpp::ok() && attempt <= lifecycle_bringup_max_attempts_; ++attempt) {
@@ -527,10 +686,14 @@ private:
 
   std::optional<uint8_t> get_lifecycle_state(const std::string & node)
   {
-    auto client = get_state_clients_[node];
-    if (!client) {
-      client = create_client<lifecycle_msgs::srv::GetState>(node + "/get_state");
-      get_state_clients_[node] = client;
+    rclcpp::Client<lifecycle_msgs::srv::GetState>::SharedPtr client;
+    {
+      std::lock_guard<std::mutex> lock(lifecycle_client_mutex_);
+      client = get_state_clients_[node];
+      if (!client) {
+        client = create_client<lifecycle_msgs::srv::GetState>(node + "/get_state");
+        get_state_clients_[node] = client;
+      }
     }
 
     if (!client->wait_for_service(service_timeout_)) {
@@ -548,10 +711,14 @@ private:
 
   bool change_lifecycle_state(const std::string & node, uint8_t transition_id)
   {
-    auto client = change_state_clients_[node];
-    if (!client) {
-      client = create_client<lifecycle_msgs::srv::ChangeState>(node + "/change_state");
-      change_state_clients_[node] = client;
+    rclcpp::Client<lifecycle_msgs::srv::ChangeState>::SharedPtr client;
+    {
+      std::lock_guard<std::mutex> lock(lifecycle_client_mutex_);
+      client = change_state_clients_[node];
+      if (!client) {
+        client = create_client<lifecycle_msgs::srv::ChangeState>(node + "/change_state");
+        change_state_clients_[node] = client;
+      }
     }
 
     if (!client->wait_for_service(service_timeout_)) {
@@ -598,6 +765,8 @@ private:
 
   rclcpp::TimerBase::SharedPtr startup_timer_;
   rclcpp::Subscription<hal::msg::HalBattery>::SharedPtr battery_sub_;
+  rclcpp::Subscription<hal::msg::HalLifecyclestatesControl>::SharedPtr
+    lifecycle_control_sub_;
 
   std::map<std::string, rclcpp::Client<lifecycle_msgs::srv::GetState>::SharedPtr>
     get_state_clients_;
@@ -606,6 +775,9 @@ private:
 
   mutable std::mutex battery_mutex_;
   std::optional<hal::msg::HalBattery> latest_battery_;
+
+  std::mutex lifecycle_client_mutex_;
+  std::mutex lifecycle_transition_mutex_;
 
   std::mutex worker_mutex_;
   std::thread worker_;
