@@ -27,6 +27,10 @@ bsp_motioncontrol_node:
     alloc_lambda: 0.01             # 推力分配阻尼因子 (DLS), (0,1000]
     deadzone_pct: 3.0              # 分配死区 (% of 各推 u_max)
 
+    # ---- 惯导 (GI510) ----
+    imu_deg2rad: true              # 惯导欧拉角单位为度, 转弧度
+    imu_yaw_offset_deg: 0.0        # 航向安装偏置(度), 静态校准时标定
+
     # ---- 话题 (下次 configure 生效) ----
     mode_topic: /hal/modecontrol
     remote_topic: /hal/remotecontrol
@@ -138,4 +142,5 @@ bsp_motioncontrol_node:
     enable_roll: true
     enable_ff: true
     enable_pid: true
-    enable_servo: false        # 舵机分配未启用, 当前周期发布零位
+    enable_servo: false        # 舵机分配未启用, 指令仅发送零位
+    servo_cmd_hz: 5.0          # 舵机指令发送频率(Hz), 0=仅数值变化时发; 防 CAN 拥塞

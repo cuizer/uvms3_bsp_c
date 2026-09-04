@@ -311,6 +311,9 @@
          this->declare_parameter<double>("alloc_lambda", 0.01);
          this->declare_parameter<int>("controller_mode", 2);   // 1=纯PID 2=FF+PID 3=FF+PID+DOB
          this->declare_parameter<double>("deadzone_pct", 3.0); // 分配死区 (% of u_max)
+         this->declare_parameter<bool>("imu_deg2rad", true);        // 惯导欧拉角(度)转弧度
+         this->declare_parameter<double>("imu_yaw_offset_deg", 0.0); // 航向安装偏置(度)
+         this->declare_parameter<double>("servo_cmd_hz", 5.0);   // 舵机指令发送频率(Hz); 0=仅数值变化时发
          this->declare_parameter<std::vector<double>>("thrust_limits",
              {441.0, 69.0, 69.0, 69.0, 69.0, 69.0});  // 各推推力上限 (N), ⚠ python 占位
          // DOB 系数 (python 命名; ⚠ 数值占位待实测, roll 量级疑似异常)
@@ -640,6 +643,15 @@
              throw std::invalid_argument(
                  "controller_mode must be 1/2/3 and deadzone_pct in [0,100]");
          }
+         imu_deg2rad_    = this->get_parameter("imu_deg2rad").as_bool();
+         imu_yaw_offset_ = this->get_parameter("imu_yaw_offset_deg").as_double() * M_PI / 180.0;
+         if (!std::isfinite(imu_yaw_offset_)) {
+             throw std::invalid_argument("imu_yaw_offset_deg must be finite");
+         }
+         servo_cmd_hz_ = this->get_parameter("servo_cmd_hz").as_double();
+         if (!std::isfinite(servo_cmd_hz_) || servo_cmd_hz_ < 0.0 || servo_cmd_hz_ > 200.0) {
+             throw std::invalid_argument("servo_cmd_hz must be in [0, 200]");
+         }
          const std::vector<double> tlim = this->get_parameter("thrust_limits").as_double_array();
          if (tlim.size() != 6U || !std::all_of(tlim.begin(), tlim.end(),
                  [](double x) { return std::isfinite(x) && x > 0.0 && x <= 1e6; })) {
@@ -791,17 +803,29 @@
         for (DobController & d : dob_) d.reset();
         tau_prev_real_.fill(0.0);
         reset_attitude_estimator();
-     }
+     
+         servo_cmd_sent_once_ = false;   // 激活/复位后下个周期重新发送一次舵机指令
+    }
  
      // ========================================================================
      // 传感器回调 (线程安全, 使用 std::atomic / mutex)
      // ========================================================================
      void imu_cb(const hal::msg::HalInertialnavi::SharedPtr msg) {
          if (!active_) return;
+         // GI510 UZHDR: Heading/Pitch/Roll 单位为度; 驱动原样透传, 此处转弧度并加安装偏置。
+         double yaw   = static_cast<double>(msg->yaw);
+         double pitch = static_cast<double>(msg->pitch);
+         double roll  = static_cast<double>(msg->roll);
+         if (imu_deg2rad_) {
+             constexpr double DEG2RAD = M_PI / 180.0;
+             yaw   *= DEG2RAD;
+             pitch *= DEG2RAD;
+             roll  *= DEG2RAD;
+         }
          std::lock_guard<std::mutex> lock(state_mutex_);
-         state_.yaw       = static_cast<double>(msg->yaw);
-         state_.pitch     = static_cast<double>(msg->pitch);
-         state_.roll      = static_cast<double>(msg->roll);
+         state_.yaw   = wrap_angle(yaw + imu_yaw_offset_);
+         state_.pitch = pitch;
+         state_.roll  = roll;
          state_.imu_valid = (msg->connection_status == 1);
      }
  
@@ -1272,21 +1296,35 @@
      // [框架] 舵机指令发布
      // ========================================================================
      void publish_servo_commands(const TargetSetpoint & /*target*/,
-                                 const VehicleState & /*state*/) {
-         if (!en_servo_) {
-             // 不使能时周期发布零位, 保持舵机回中锁力
-             auto tail_zero = std_msgs::msg::Float64MultiArray();
-             tail_zero.data = {0.0, 0.0, 0.0, 0.0};
-             tail_cmd_pub_->publish(tail_zero);
- 
-             auto wing_zero = std_msgs::msg::Float64MultiArray();
-             wing_zero.data = {0.0, 0.0};
-             wing_cmd_pub_->publish(wing_zero);
-             return;
+                                   const VehicleState & /*state*/) {
+         // 舵机指令限频: 避免 50Hz 连续下发造成 CAN 总线与舵机处理拥塞
+         // (曾导致 hal_servo_node 看门狗误判断连)。策略:
+         //   - 数值变化 → 立即发送;
+         //   - 未变化 → 按 servo_cmd_hz_ 周期保持发送 (默认5Hz; 0=不再周期发送)。
+         const auto now = std::chrono::steady_clock::now();
+         const std::array<double, 4> tail_des = {0.0, 0.0, 0.0, 0.0}; // 未来: 分配输出
+         const std::array<double, 2> wing_des = {0.0, 0.0};
+         bool changed = !servo_cmd_sent_once_ ||
+                        tail_des != last_tail_cmd_sent_ ||
+                        wing_des != last_wing_cmd_sent_;
+         bool due = false;
+         if (servo_cmd_hz_ > 0.0) {
+             const double elapsed = std::chrono::duration<double>(
+                 now - last_servo_cmd_time_).count();
+             due = elapsed >= (1.0 / servo_cmd_hz_);
          }
- 
-         // Servo allocation remains disabled until the actuator mapping is defined.
-         // 例如: 根据期望俯仰/横摇力矩计算尾舵/翼舵偏角
+         if (!changed && !due) return;
+     
+         auto tail_msg = std_msgs::msg::Float64MultiArray();
+         tail_msg.data.assign(tail_des.begin(), tail_des.end());
+         tail_cmd_pub_->publish(tail_msg);
+         auto wing_msg = std_msgs::msg::Float64MultiArray();
+         wing_msg.data.assign(wing_des.begin(), wing_des.end());
+         wing_cmd_pub_->publish(wing_msg);
+         last_tail_cmd_sent_  = tail_des;
+         last_wing_cmd_sent_  = wing_des;
+         last_servo_cmd_time_ = now;
+         servo_cmd_sent_once_ = true;
      }
  
      // ========================================================================
@@ -1550,6 +1588,19 @@
                      if (v < 1 || v > 3) {
                          return reject(n + ": 需为 1/2/3");
                      }
+                 } else if (n == "imu_deg2rad") {
+                     try { (void)p.as_bool(); } catch (const std::exception &) {
+                         return reject(n + ": 需要 bool 类型");
+                     }
+                 } else if (n == "servo_cmd_hz") {
+                     const double v = param_to_double(p);
+                     if (!std::isfinite(v) || v < 0.0 || v > 200.0) {
+                         return reject(n + ": 需在 [0, 200] 内");
+                     }
+                 } else if (n == "imu_yaw_offset_deg") {
+                     if (!std::isfinite(param_to_double(p))) {
+                         return reject(n + ": 必须为有限值");
+                     }
                  } else if (n == "deadzone_pct") {
                      const double v = param_to_double(p);
                      if (!std::isfinite(v) || v < 0.0 || v > 100.0) {
@@ -1675,6 +1726,12 @@
                      dob_[dob_row].reset();  // 模型系数变更: 清观测器状态避免突变
                  } else if (n == "controller_mode") {
                      controller_mode_ = static_cast<int>(param_to_int(p));
+                 } else if (n == "imu_deg2rad") {
+                     imu_deg2rad_ = p.as_bool();
+                 } else if (n == "servo_cmd_hz") {
+                     servo_cmd_hz_ = param_to_double(p);
+                 } else if (n == "imu_yaw_offset_deg") {
+                     imu_yaw_offset_ = param_to_double(p) * M_PI / 180.0;
                  } else if (n == "deadzone_pct") {
                      deadzone_pct_ = param_to_double(p);
                  } else if (n == "thrust_limits") {
@@ -1767,6 +1824,13 @@
      std::array<DobController, 6> dob_{};          // DOB 状态 (行序 Fx..Mz)
      std::array<double, 6> tau_prev_real_{};       // 上一拍实际 wrench T·u (N)
      // -- 角速率估计 (姿态差分) --
+     bool   imu_deg2rad_    = true;
+     double imu_yaw_offset_ = 0.0;
+     double servo_cmd_hz_ = 5.0;
+     std::chrono::steady_clock::time_point last_servo_cmd_time_{};
+     std::array<double, 4> last_tail_cmd_sent_{};
+     std::array<double, 2> last_wing_cmd_sent_{};
+     bool   servo_cmd_sent_once_ = false;
      bool att_initialized_ = false;
      double prev_yaw_ = 0.0;
      double prev_pitch_ = 0.0;
