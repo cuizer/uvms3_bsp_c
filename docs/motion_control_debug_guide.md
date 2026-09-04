@@ -291,25 +291,24 @@ ros2 param dump /bsp_motioncontrol_node --output-dir ~/auv_tuning
 
 ---
 
-## 6. ⚠ 占位参数替换流程（G1–G4）
+## 6. 物理参数核对状态（G1–G4）
 
-yaml 中标 ⚠ 的值是 python 版移植的**占位值**，直接影响 DOB 与分配的物理正确性，建议尽早替换：
+阻尼 Dl/Dnl、推进器布局、thrust_limits、roll 惯量已由总体提供并填入代码与参考基线（2026-09）；剩余待办如下表：
 
 | 组 | 参数 | 现在值(⚠) | 真实来源 |
 |---|---|---|---|
-| G2 | `thrust_limits` [主推,5×辅推] N | 441, 69×5 | 台架实测各推正/反最大推力 |
-| G3 | `surge.mass_eff` | 275 kg | 质量+附加质量(或实测) |
-| G3 | `sway/depth.mass_eff` | 526.8 kg | 同上 |
-| G3 | `yaw.mass_eff` / `pitch.mass_eff` | 472.9 / 472.0 kg·m² | 转动惯量(模型或摆测) |
-| G3 | `roll.mass_eff` / `damp_eff` | **4.345 / 0.434 ⚠⚠ 疑似笔误** | 优先核对: 与 pitch/yaw 同量级(几十~几百 kg·m²)才合理 |
-| G4 | `*.damp_eff` | 47~125 | 阻尼辨识/CFD |
-| G1 | `alloc_matrix` 36 元素 | 占位几何 | 推进器安装位置/方向计算(§设计文档6.1) |
-| G2/G7 | 输出符号与正反转 | — | 台架单推验证(§3.1 第3条) |
+| G2 | `thrust_limits` [主推,5×辅推] N | 441, 69×5 ✅ | 总体确认无误; 反向推力上限待台架实测(当前按对称) |
+| G3 | `surge.mass_eff` | 275 kg ⏳ | 待最终模型文档核对 (质量+附加质量) |
+| G3 | `sway/depth.mass_eff` | 526.8 kg ⏳ | 待最终模型文档核对 |
+| G3 | `yaw.mass_eff` / `pitch.mass_eff` | 472.9 / 472.0 kg·m² ⏳ | 待最终模型文档核对 |
+| G3 | `roll.mass_eff` / `damp_eff` | 4.345 / 0.434 ✅ | 细长回转体, 总体确认合理 (横摇惯量小); damp=Dl |
+| G4 | `*.damp_eff` | surge 2.5; sway/depth 125; roll 0.434; pitch/yaw 47.2 ✅ | 已按 Dl 填入 (ff 前馈同步 Dl/Dnl) |
+| G1 | `alloc_matrix` 36 元素 | 已按真实布局填入 ✅ | 无斜装; 位置见代码/yaml 注释; **列符号仍待台架验证** |
+| G2/G7 | 输出符号与正反转 | — | 台架单推验证(§3.1 第3条): 若某推反向, 翻转该列全部符号 |
 
-替换步骤：拿到实测/模型值 → 更新基线参数（当前先改 `docs/bsp_motioncontrol_reference.yaml` 留档；
-随包基线落地后改 `config/bsp_motioncontrol.yaml` 并 `colcon build --packages-select bsp`）→ 重启节点验证。
+替换步骤：拿到剩余实测/模型值(mass_eff 等) → 更新代码默认值与 `docs/bsp_motioncontrol_reference.yaml`（保持两者一致）→ `colcon build --packages-select bsp` 验证。
 
-> roll 特别注意：若 roll 惯量真的是 ~4 kg·m² 说明数值单位/来源有误（一艘 AUV 的横摇惯量通常与纵摇同量级）。**在 mode3 之前必须先核对**，否则 roll 通道 DOB 会以错误模型估计扰动。
+> 注：roll 惯量 4.345 kg·m² 已由总体确认为细长回转体合理（横摇惯量小、Dl=0.434 对应），原“疑似笔误”标注已撤销。
 
 ---
 

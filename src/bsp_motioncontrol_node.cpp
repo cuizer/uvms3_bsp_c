@@ -316,7 +316,7 @@
          // DOB 系数 (python 命名; ⚠ 数值占位待实测, roll 量级疑似异常)
          this->declare_parameter<double>("surge.dob_bandwidth", 3.0);
          this->declare_parameter<double>("surge.mass_eff", 275.0);
-         this->declare_parameter<double>("surge.damp_eff", 50.0);
+         this->declare_parameter<double>("surge.damp_eff", 2.5);   // Dl 实测 (线性阻尼)
          this->declare_parameter<double>("sway.dob_bandwidth", 3.0);
          this->declare_parameter<double>("sway.mass_eff", 526.8);
          this->declare_parameter<double>("sway.damp_eff", 125.0);
@@ -330,8 +330,8 @@
          this->declare_parameter<double>("pitch.mass_eff", 472.0);
          this->declare_parameter<double>("pitch.damp_eff", 47.2);
          this->declare_parameter<double>("roll.dob_bandwidth", 1.5);
-         this->declare_parameter<double>("roll.mass_eff", 4.345);   // ⚠ 量级存疑, 待实测
-         this->declare_parameter<double>("roll.damp_eff", 0.434);   // ⚠ 量级存疑, 待实测
+         this->declare_parameter<double>("roll.mass_eff", 4.345);   // 细长回转体, 模型提供 (横摇惯量小合理)
+         this->declare_parameter<double>("roll.damp_eff", 0.434);   // Dl 实测
  
          // ----- PID 参数 (每自由度独立) -----
          // Surge (vx)
@@ -377,28 +377,34 @@
          this->declare_parameter<double>("pid_roll.max_out", 150.0);
  
          // ----- 前馈参数 (阻尼系数) -----
-         this->declare_parameter<double>("ff.drag_linear_x",   50.0);
-         this->declare_parameter<double>("ff.drag_quadratic_x", 120.0);
-         this->declare_parameter<double>("ff.drag_linear_y",   60.0);
-         this->declare_parameter<double>("ff.drag_quadratic_y", 140.0);
-         this->declare_parameter<double>("ff.drag_linear_z",   80.0);
-         this->declare_parameter<double>("ff.drag_quadratic_z", 180.0);
-         this->declare_parameter<double>("ff.drag_linear_yaw",   30.0);
-         this->declare_parameter<double>("ff.drag_quadratic_yaw", 80.0);
+         this->declare_parameter<double>("ff.drag_linear_x", 2.5);  // Dl/Dnl 实测
+         this->declare_parameter<double>("ff.drag_quadratic_x", 10.0);  // Dl/Dnl 实测
+         this->declare_parameter<double>("ff.drag_linear_y", 125.0);  // Dl/Dnl 实测
+         this->declare_parameter<double>("ff.drag_quadratic_y", 747.0);  // Dl/Dnl 实测
+         this->declare_parameter<double>("ff.drag_linear_z", 125.0);  // Dl/Dnl 实测
+         this->declare_parameter<double>("ff.drag_quadratic_z", 747.0);  // Dl/Dnl 实测
+         this->declare_parameter<double>("ff.drag_linear_yaw", 47.2);  // Dl/Dnl 实测
+         this->declare_parameter<double>("ff.drag_quadratic_yaw", 1262.0);  // Dl/Dnl 实测
          this->declare_parameter<double>("ff.buoyancy_trim",   0.0);
  
          // ----- 控制分配矩阵 T (6×6, 行优先) -----
-         //  T ∈ R^(6×6):   τ = T · u
-         //  列/输出顺序: [主推0x301, 辅推ID2, 辅推ID3, 辅推ID4, 辅推ID5, 辅推ID6]
-         //  行顺序: [Fx, Fy, Fz, Mx, My, Mz]
+         //  T ∈ R^(6×6):  τ = T · u,  u 单位 N (各推), 行序 [Fx,Fy,Fz,Mx,My,Mz]
+         // 列/输出顺序: [主推0x301, ID2, ID3, ID4, ID5, ID6]
+         // 真实布局 (2026-09 总体提供, 无斜装):
+         //   ID1主推 x≈0; ID2侧推 x=-1.78283(后); ID3/4垂推 x=-1.6631(后), y=∓0.075(间距150mm);
+         //   ID5垂推 x=+1.6236(前); ID6侧推 x=+1.74559(前)
+         // 约定: x 前为正, z 向下为正; 正指令=该推沿体轴产生正向力 (主推+x, 侧推+y, 垂推+z)
+         // 力矩按 τ=r×F: Mx=y·Fz, My=-x·Fz, Mz=x·Fy
+         // ⚠ 指令符号与物理推力方向的最终对应以台架正反转验证为准;
+         //   若某推实测反向, 翻转 alloc_matrix 中该列全部符号即可 (改参数, 无需重编)
          std::vector<double> default_T = {
-             // Main  ID2   ID3   ID4   ID5   ID6
-                1.0,  0.0,  0.0,  0.0,  0.5,  0.5,  // Fx
-                0.0,  0.0,  0.0,  1.0,  1.0,  0.0,  // Fy
-                0.0,  1.0,  1.0,  0.0,  0.0,  0.0,  // Fz
-                0.0,  0.1, -0.1,  0.0,  0.0,  0.0,  // Mx
-                0.0,  0.3,  0.3,  0.0,  0.0,  0.0,  // My
-                0.0,  0.0,  0.0,  0.2, -0.2,  0.1,  // Mz
+             //  Main     ID2       ID3      ID4      ID5      ID6
+                 1.0,    0.0,      0.0,     0.0,     0.0,     0.0,      // Fx  主推
+                 0.0,    1.0,      0.0,     0.0,     0.0,     1.0,      // Fy  ID2+ID6 同向=横荡
+                 0.0,    0.0,      1.0,     1.0,     1.0,     0.0,      // Fz  ID3+ID4+ID5 垂推
+                 0.0,    0.0,     -0.075,   0.075,   0.0,     0.0,      // Mx  y·Fz (ID3=-y, ID4=+y)
+                 0.0,    0.0,      1.6631,  1.6631, -1.6236,  0.0,      // My  -x·Fz (后推/前推差动=纵倾)
+                 0.0,   -1.78283,  0.0,     0.0,     0.0,     1.74559,  // Mz  x·Fy (后/前侧推差动=转艏)
          };
          this->declare_parameter<std::vector<double>>("alloc_matrix", default_T);
  
