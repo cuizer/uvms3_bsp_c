@@ -18,14 +18,14 @@
 
 #include "hal/msg/hal_antenna_control.hpp"
 #include "hal/msg/hal_light_control.hpp"
-#include "hal/msg/hal_thruster_control.hpp"
-#include "hal/msg/hal_servo_control.hpp"
 #include "hal/msg/hal_mode_control.hpp"
 #include "hal/msg/hal_lifecyclestates_control.hpp"
 #include "hal/msg/hal_remote_control.hpp"
 #include "hal/msg/hal_dvl_control.hpp"
 
 #include "hal/srv/hal_battery_control_srv.hpp"
+#include "hal/srv/hal_thrustercontrol_srv.hpp"
+#include "hal/srv/hal_servocontrol_srv.hpp"
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -74,14 +74,14 @@ public:
         
         antenna_control_pub_    = this->create_publisher<hal::msg::HalAntennaControl>("/hal/antennacontrol", 10);
         light_control_pub_      = this->create_publisher<hal::msg::HalLightControl>("/hal/lightcontrol", 10);
-        thruster_control_pub_   = this->create_publisher<hal::msg::HalThrusterControl>("/hal/thrustercontrol", 10);
-        servo_control_pub_      = this->create_publisher<hal::msg::HalServoControl>("/hal/servocontrol", 10);
         mode_control_pub_       = this->create_publisher<hal::msg::HalModeControl>("/hal/modecontrol", 10);
         remote_control_pub_     = this->create_publisher<hal::msg::HalRemoteControl>("/hal/remotecontrol", 10);
         dvl_control_pub_        = this->create_publisher<hal::msg::HalDVLControl>("/hal/dvlcontrol", 10);
         lifecycle_states_control_pub_ = this->create_publisher<hal::msg::HalLifecyclestatesControl>("/hal/lifecyclestatescontrol", 10);
         
-        battery_control_client_ = this->create_client<hal::srv::HalBatteryControlSrv>("/hal/batterycontrol");
+        battery_control_client_  = this->create_client<hal::srv::HalBatteryControlSrv>("/hal/batterycontrol");
+        thruster_control_client_ = this->create_client<hal::srv::HalThrustercontrolSrv>("/hal/thrustercontrol");
+        servo_control_client_    = this->create_client<hal::srv::HalServocontrolSrv>("/hal/servocontrol");
  
         local_ip_ = this->get_parameter("local_ip").as_string();
         local_port_ = this->get_parameter("local_port").as_int();
@@ -141,8 +141,6 @@ public:
 
         if (light_control_pub_) {light_control_pub_->on_activate();}
         if (antenna_control_pub_) {antenna_control_pub_->on_activate();}
-        if (thruster_control_pub_) {thruster_control_pub_->on_activate();}
-        if (servo_control_pub_) {servo_control_pub_->on_activate();}
         if (mode_control_pub_) {mode_control_pub_->on_activate();}
         if (remote_control_pub_) {remote_control_pub_->on_activate();}
         if (dvl_control_pub_) {dvl_control_pub_->on_activate();}
@@ -790,13 +788,13 @@ private:
     
     rclcpp_lifecycle::LifecyclePublisher<hal::msg::HalAntennaControl>::SharedPtr antenna_control_pub_;
     rclcpp_lifecycle::LifecyclePublisher<hal::msg::HalLightControl>::SharedPtr light_control_pub_;
-    rclcpp_lifecycle::LifecyclePublisher<hal::msg::HalThrusterControl>::SharedPtr thruster_control_pub_;
-    rclcpp_lifecycle::LifecyclePublisher<hal::msg::HalServoControl>::SharedPtr servo_control_pub_;
     rclcpp_lifecycle::LifecyclePublisher<hal::msg::HalModeControl>::SharedPtr mode_control_pub_;
     rclcpp_lifecycle::LifecyclePublisher<hal::msg::HalLifecyclestatesControl>::SharedPtr lifecycle_states_control_pub_;
     rclcpp_lifecycle::LifecyclePublisher<hal::msg::HalRemoteControl>::SharedPtr remote_control_pub_;
     rclcpp_lifecycle::LifecyclePublisher<hal::msg::HalDVLControl>::SharedPtr dvl_control_pub_;
     rclcpp::Client<hal::srv::HalBatteryControlSrv>::SharedPtr battery_control_client_;
+    rclcpp::Client<hal::srv::HalThrustercontrolSrv>::SharedPtr thruster_control_client_;
+    rclcpp::Client<hal::srv::HalServocontrolSrv>::SharedPtr servo_control_client_;
 
     std::optional<hal::msg::HalInertialnavi> inertial_data_;
     std::optional<hal::msg::HalDvl> dvl_data_;
@@ -926,34 +924,6 @@ private:
         RCLCPP_INFO(this->get_logger(), "Published /hal/antenna_control");
     }
     
-    // 推进器控制 
-    void thruster_control(const std::vector<uint8_t>& payload)
-    {
-        if(payload.size() != 1) {RCLCPP_WARN(this->get_logger(), "Thruster command payload length error: %ld", payload.size()); return;}
-
-        uint8_t thruster_cmd = payload[0];
-
-        auto msg = hal::msg::HalThrusterControl();
-        msg.thrustercontrol_cmd = thruster_cmd;
-        thruster_control_pub_->publish(msg);
-
-        RCLCPP_INFO(this->get_logger(),"Publish thruster control command: %d", thruster_cmd);
-    }
-    
-    // 舵机控制 
-    void servo_control(const std::vector<uint8_t>& payload)
-    {
-        if(payload.size() != 1) {RCLCPP_WARN(this->get_logger(), "Servo command payload length error: %ld", payload.size()); return;}
-
-        uint8_t servo_cmd = payload[0];
-
-        auto msg = hal::msg::HalServoControl();
-        msg.servocontrol_cmd = servo_cmd;
-        servo_control_pub_->publish(msg);
-
-        RCLCPP_INFO(this->get_logger(),"Publish servo control command: %d", servo_cmd);
-    }
-
      // 模式控制 
     void mode_control(const std::vector<uint8_t>& payload)
     {
@@ -1050,6 +1020,52 @@ private:
                     RCLCPP_INFO(this->get_logger(), "Battery service response: cmd=0x%02X, success=%d, message=%s", cmd, response->success, response->message.c_str());
                     }
                 catch (const std::exception& e) {RCLCPP_ERROR(this->get_logger(), "Battery service call failed: %s", e.what());}
+            }
+        );
+    }
+    
+    // 推进器控制 
+    void thruster_control(const std::vector<uint8_t>& payload)
+    {
+        if (!thruster_control_client_->service_is_ready()) {RCLCPP_WARN(this->get_logger(), "/hal/thrustercontrol service not ready"); return;}
+        if(payload.size() != 1) {RCLCPP_WARN(this->get_logger(), "Thruster command payload length error: %ld", payload.size()); return;}
+        
+        uint8_t cmd = payload[0];
+        RCLCPP_INFO(this->get_logger(), "Thruster command received: cmd=0x%02X", cmd);
+
+        auto request = std::make_shared<hal::srv::HalThrustercontrolSrv::Request>();
+        request->command = cmd;
+
+        thruster_control_client_->async_send_request(request, [this, cmd](rclcpp::Client<hal::srv::HalThrustercontrolSrv>::SharedFuture future)
+            {
+                try {
+                    auto response = future.get();
+                    RCLCPP_INFO(this->get_logger(), "Thruster service response: cmd=0x%02X, success=%d, message=%s", cmd, response->success, response->message.c_str());
+                    }
+                catch (const std::exception& e) {RCLCPP_ERROR(this->get_logger(), "Thruster service call failed: %s", e.what());}
+            }
+        );
+    }
+    
+    // 舵机控制 
+    void servo_control(const std::vector<uint8_t>& payload)
+    {
+        if (!servo_control_client_->service_is_ready()) {RCLCPP_WARN(this->get_logger(), "/hal/servocontrol service not ready"); return;}
+        if(payload.size() != 1) {RCLCPP_WARN(this->get_logger(), "Servo command payload length error: %ld", payload.size()); return;}
+        
+        uint8_t cmd = payload[0];
+        RCLCPP_INFO(this->get_logger(), "Servo command received: cmd=0x%02X", cmd);
+
+        auto request = std::make_shared<hal::srv::HalServocontrolSrv::Request>();
+        request->command = cmd;
+
+        servo_control_client_->async_send_request(request, [this, cmd](rclcpp::Client<hal::srv::HalServocontrolSrv>::SharedFuture future)
+            {
+                try {
+                    auto response = future.get();
+                    RCLCPP_INFO(this->get_logger(), "Servo service response: cmd=0x%02X, success=%d, message=%s", cmd, response->success, response->message.c_str());
+                    }
+                catch (const std::exception& e) {RCLCPP_ERROR(this->get_logger(), "Servo service call failed: %s", e.what());}
             }
         );
     }
