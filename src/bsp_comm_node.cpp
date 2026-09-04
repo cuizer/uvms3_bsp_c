@@ -1,9 +1,10 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
-#include <std_msgs/msg/u_int8_multi_array.hpp> 
+
 #include <sensor_msgs/msg/image.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
+#include <std_msgs/msg/u_int8_multi_array.hpp> 
 
 #include "hal/msg/hal_inertialnavi.hpp"
 #include "hal/msg/hal_dvl.hpp"
@@ -15,14 +16,16 @@
 #include "hal/msg/hal_armmotor.hpp"
 #include "hal/msg/hal_antenna.hpp"
 
-
 #include "hal/msg/hal_antenna_control.hpp"
 #include "hal/msg/hal_light_control.hpp"
 #include "hal/msg/hal_mode_control.hpp"
+#include "hal/msg/hal_lifecyclestates_control.hpp"
 #include "hal/msg/hal_remote_control.hpp"
 #include "hal/msg/hal_dvl_control.hpp"
 
 #include "hal/srv/hal_battery_control_srv.hpp"
+#include "hal/srv/hal_thrustercontrol_srv.hpp"
+#include "hal/srv/hal_servocontrol_srv.hpp"
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -63,15 +66,9 @@ public:
         tailservo_sub_    = this->create_subscription<hal::msg::HalTailservo>("/hal/tailservo",qos,std::bind(&BspCommNode::tailservo_callback, this, std::placeholders::_1));
         armmotor_sub_     = this->create_subscription<hal::msg::HalArmmotor>("/hal/armmotor",qos,std::bind(&BspCommNode::armmotor_callback, this, std::placeholders::_1));
         antenna_sub_      = this->create_subscription<hal::msg::HalAntenna>("/hal/antenna",qos,std::bind(&BspCommNode::antenna_callback, this, std::placeholders::_1));
-        // 订阅系统生命周期状态并直接 UDP 下发 (指令码 0x0D)
-        sys_state_sub_ = this->create_subscription<std_msgs::msg::UInt8MultiArray>("/system/lifecycle_states", qos,[this](const std_msgs::msg::UInt8MultiArray::SharedPtr msg) {
-                if (!active_) return; // 只有网关处于 active 状态才发送
-                // 将 std::vector<uint8_t> 直接封装并发送
-                auto packet = build_packet(0x0D, msg->data);
-                sendto(sock_, packet.data(), packet.size(), 0, 
-                       reinterpret_cast<struct sockaddr*>(&target_addr_), sizeof(target_addr_));
-            }
-        );
+        
+        lifecycle_states_sub_ =this->create_subscription<std_msgs::msg::UInt8MultiArray>("/system/lifecycle_states", 10, std::bind(&BspCommNode::lifecycle_states_callback, this, std::placeholders::_1));
+    
         // color_image_sub_  = this->create_subscription<sensor_msgs::msg::Image>("/uvms/perception/image_raw",rclcpp::SensorDataQoS(),std::bind(&BspCommNode::color_image_callback, this, std::placeholders::_1));
         // depth_image_sub_  = this->create_subscription<sensor_msgs::msg::Image>("/uvms/perception/depth",rclcpp::SensorDataQoS(),std::bind(&BspCommNode::depth_image_callback, this, std::placeholders::_1));
         
@@ -80,8 +77,11 @@ public:
         mode_control_pub_       = this->create_publisher<hal::msg::HalModeControl>("/hal/modecontrol", 10);
         remote_control_pub_     = this->create_publisher<hal::msg::HalRemoteControl>("/hal/remotecontrol", 10);
         dvl_control_pub_        = this->create_publisher<hal::msg::HalDVLControl>("/hal/dvlcontrol", 10);
+        lifecycle_states_control_pub_ = this->create_publisher<hal::msg::HalLifecyclestatesControl>("/hal/lifecyclestatescontrol", 10);
         
-        battery_control_client_ = this->create_client<hal::srv::HalBatteryControlSrv>("/hal/batterycontrol");
+        battery_control_client_  = this->create_client<hal::srv::HalBatteryControlSrv>("/hal/batterycontrol");
+        thruster_control_client_ = this->create_client<hal::srv::HalThrustercontrolSrv>("/hal/thrustercontrol");
+        servo_control_client_    = this->create_client<hal::srv::HalServocontrolSrv>("/hal/servocontrol");
  
         local_ip_ = this->get_parameter("local_ip").as_string();
         local_port_ = this->get_parameter("local_port").as_int();
@@ -133,20 +133,18 @@ public:
     }
 
     CallbackReturn on_activate(const rclcpp_lifecycle::State &)
-{
-    active_ = true;
-    udp_recv_running_ = true;
+    {
+        active_ = true;
+        udp_recv_running_ = true;
+        udp_recv_thread_ = std::thread(&BspCommNode::udp_receive_function, this);
+        return CallbackReturn::SUCCESS;
 
         if (light_control_pub_) {light_control_pub_->on_activate();}
         if (antenna_control_pub_) {antenna_control_pub_->on_activate();}
         if (mode_control_pub_) {mode_control_pub_->on_activate();}
         if (remote_control_pub_) {remote_control_pub_->on_activate();}
         if (dvl_control_pub_) {dvl_control_pub_->on_activate();}
-
-
-    udp_recv_thread_ = std::thread(&BspCommNode::udp_receive_function, this);
-    return CallbackReturn::SUCCESS;
-}
+    }
 
     CallbackReturn on_deactivate(const rclcpp_lifecycle::State &)
     {
@@ -242,6 +240,12 @@ private:
     {
         if (!active_) return;
         antenna_data_ = *msg;
+    }
+    
+    void lifecycle_states_callback(const std_msgs::msg::UInt8MultiArray::SharedPtr msg)
+    {
+        if (!active_) return;
+        lifecycle_states_data_ = *msg;
     }
     
     void color_image_callback(const sensor_msgs::msg::Image::SharedPtr msg)
@@ -413,6 +417,17 @@ private:
         memcpy(p, &msg.running_status, sizeof(uint8_t)); p += sizeof(uint8_t);
         memcpy(p, &msg.total_angle, sizeof(double));
 
+        return buf;
+    }
+    
+    std::vector<uint8_t> pack_lifecycle_states(const std_msgs::msg::UInt8MultiArray & msg)
+    {
+        std::vector<uint8_t> buf(msg.data.size());
+
+        if (!msg.data.empty())
+        {
+            memcpy(buf.data(), msg.data.data(), msg.data.size());
+        }
         return buf;
     }
 
@@ -703,6 +718,16 @@ private:
             
             sendto(sock_, packet.data(), packet.size(), 0, reinterpret_cast<struct sockaddr*>(&target_addr_), sizeof(target_addr_));
         }
+   
+    // ---------- Lifecycle ----------     
+        if (lifecycle_states_data_.has_value())
+        {
+            const auto & msg = lifecycle_states_data_.value();
+            auto payload = pack_lifecycle_states(msg);
+            auto packet = build_packet(0x15, payload);
+
+            sendto(sock_, packet.data(), packet.size(), 0, reinterpret_cast<struct sockaddr*>(&target_addr_), sizeof(target_addr_));
+        }
         
         
     }
@@ -759,14 +784,17 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr color_image_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_image_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
-    rclcpp::Subscription<std_msgs::msg::UInt8MultiArray>::SharedPtr sys_state_sub_;
+    rclcpp::Subscription<std_msgs::msg::UInt8MultiArray>::SharedPtr lifecycle_states_sub_;
     
     rclcpp_lifecycle::LifecyclePublisher<hal::msg::HalAntennaControl>::SharedPtr antenna_control_pub_;
     rclcpp_lifecycle::LifecyclePublisher<hal::msg::HalLightControl>::SharedPtr light_control_pub_;
     rclcpp_lifecycle::LifecyclePublisher<hal::msg::HalModeControl>::SharedPtr mode_control_pub_;
+    rclcpp_lifecycle::LifecyclePublisher<hal::msg::HalLifecyclestatesControl>::SharedPtr lifecycle_states_control_pub_;
     rclcpp_lifecycle::LifecyclePublisher<hal::msg::HalRemoteControl>::SharedPtr remote_control_pub_;
     rclcpp_lifecycle::LifecyclePublisher<hal::msg::HalDVLControl>::SharedPtr dvl_control_pub_;
     rclcpp::Client<hal::srv::HalBatteryControlSrv>::SharedPtr battery_control_client_;
+    rclcpp::Client<hal::srv::HalThrustercontrolSrv>::SharedPtr thruster_control_client_;
+    rclcpp::Client<hal::srv::HalServocontrolSrv>::SharedPtr servo_control_client_;
 
     std::optional<hal::msg::HalInertialnavi> inertial_data_;
     std::optional<hal::msg::HalDvl> dvl_data_;
@@ -777,6 +805,7 @@ private:
     std::optional<hal::msg::HalTailservo> tailservo_data_;
     std::optional<hal::msg::HalArmmotor> armmotor_data_;
     std::optional<hal::msg::HalAntenna> antenna_data_;
+    std::optional<std_msgs::msg::UInt8MultiArray> lifecycle_states_data_;
 
     int sock_{-1};
     std::string local_ip_;
@@ -818,6 +847,14 @@ private:
             case 0x31:
             {antenna_control(payload); break;}
             
+            // 推进器控制
+            case 0x33:
+            {thruster_control(payload); break;}
+            
+            // 舵机控制
+            case 0x34:
+            {servo_control(payload); break;}
+            
             // 电池控制
             case 0x35:
             {battery_control(payload); break;}
@@ -833,6 +870,10 @@ private:
             // DVL控制
             case 0x44:
             {dvl_control(payload); break;}
+            
+            // 节点状态控制
+            case 0x45:
+            {lifecycle_states_control(payload); break;}
 
             default:
             {RCLCPP_WARN(this->get_logger(), "Unknown command id: 0x%02X", msg_id); break;}
@@ -882,7 +923,7 @@ private:
 
         RCLCPP_INFO(this->get_logger(), "Published /hal/antenna_control");
     }
-
+    
      // 模式控制 
     void mode_control(const std::vector<uint8_t>& payload)
     {
@@ -944,6 +985,23 @@ private:
         RCLCPP_INFO(this->get_logger(),"Publish DVL control command: %d", dvl_cmd);
     }
     
+    // 节点状态控制 
+    void lifecycle_states_control(const std::vector<uint8_t>& payload)
+    {
+        if(payload.size() != 2) {RCLCPP_WARN(this->get_logger(), "Lifecycle_states command payload length error: %ld", payload.size()); return;}
+
+        uint8_t lifecycle_node = payload[0];
+        uint8_t states_cmd = payload[1];
+
+        auto msg = hal::msg::HalLifecyclestatesControl();
+        msg.lifecycle_node = lifecycle_node;
+        msg.states_cmd = states_cmd;
+        lifecycle_states_control_pub_->publish(msg);
+
+        RCLCPP_INFO(this->get_logger(), "Publish lifecycle control command: node=%d, cmd=%d", lifecycle_node, states_cmd);
+    }
+    
+    // 电池控制 
     void battery_control(const std::vector<uint8_t>& payload)
     {
         if (!battery_control_client_->service_is_ready()) {RCLCPP_WARN(this->get_logger(), "/hal/batterycontrol service not ready"); return;}
@@ -962,6 +1020,52 @@ private:
                     RCLCPP_INFO(this->get_logger(), "Battery service response: cmd=0x%02X, success=%d, message=%s", cmd, response->success, response->message.c_str());
                     }
                 catch (const std::exception& e) {RCLCPP_ERROR(this->get_logger(), "Battery service call failed: %s", e.what());}
+            }
+        );
+    }
+    
+    // 推进器控制 
+    void thruster_control(const std::vector<uint8_t>& payload)
+    {
+        if (!thruster_control_client_->service_is_ready()) {RCLCPP_WARN(this->get_logger(), "/hal/thrustercontrol service not ready"); return;}
+        if(payload.size() != 1) {RCLCPP_WARN(this->get_logger(), "Thruster command payload length error: %ld", payload.size()); return;}
+        
+        uint8_t cmd = payload[0];
+        RCLCPP_INFO(this->get_logger(), "Thruster command received: cmd=0x%02X", cmd);
+
+        auto request = std::make_shared<hal::srv::HalThrustercontrolSrv::Request>();
+        request->command = cmd;
+
+        thruster_control_client_->async_send_request(request, [this, cmd](rclcpp::Client<hal::srv::HalThrustercontrolSrv>::SharedFuture future)
+            {
+                try {
+                    auto response = future.get();
+                    RCLCPP_INFO(this->get_logger(), "Thruster service response: cmd=0x%02X, success=%d, message=%s", cmd, response->success, response->message.c_str());
+                    }
+                catch (const std::exception& e) {RCLCPP_ERROR(this->get_logger(), "Thruster service call failed: %s", e.what());}
+            }
+        );
+    }
+    
+    // 舵机控制 
+    void servo_control(const std::vector<uint8_t>& payload)
+    {
+        if (!servo_control_client_->service_is_ready()) {RCLCPP_WARN(this->get_logger(), "/hal/servocontrol service not ready"); return;}
+        if(payload.size() != 1) {RCLCPP_WARN(this->get_logger(), "Servo command payload length error: %ld", payload.size()); return;}
+        
+        uint8_t cmd = payload[0];
+        RCLCPP_INFO(this->get_logger(), "Servo command received: cmd=0x%02X", cmd);
+
+        auto request = std::make_shared<hal::srv::HalServocontrolSrv::Request>();
+        request->command = cmd;
+
+        servo_control_client_->async_send_request(request, [this, cmd](rclcpp::Client<hal::srv::HalServocontrolSrv>::SharedFuture future)
+            {
+                try {
+                    auto response = future.get();
+                    RCLCPP_INFO(this->get_logger(), "Servo service response: cmd=0x%02X, success=%d, message=%s", cmd, response->success, response->message.c_str());
+                    }
+                catch (const std::exception& e) {RCLCPP_ERROR(this->get_logger(), "Servo service call failed: %s", e.what());}
             }
         );
     }
