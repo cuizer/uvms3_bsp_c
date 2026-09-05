@@ -50,6 +50,41 @@ public:
         this->declare_parameter<std::string>("target_ip", "192.168.137.1");
         this->declare_parameter<int>("target_port", 8114);
     }
+    
+    bool init_udp_socket()
+    {if (sock_ >= 0) {close(sock_); sock_ = -1;}
+    sock_ = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (sock_ < 0) {RCLCPP_ERROR(this->get_logger(), "UDP socket create failed, errno=%d (%s)", errno, strerror(errno)); return false;}
+
+    int opt = 1;
+    setsockopt(sock_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+
+    setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    memset(&local_addr_, 0, sizeof(local_addr_));
+
+    local_addr_.sin_family = AF_INET;
+    local_addr_.sin_port = htons(local_port_);
+
+    local_addr_.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(sock_, reinterpret_cast<sockaddr*>(&local_addr_), sizeof(local_addr_)) < 0)
+    {RCLCPP_ERROR(this->get_logger(), "UDP bind failed on port %d, errno=%d (%s)", local_port_, errno, strerror(errno)); close(sock_); sock_ = -1; return false;}
+
+    memset(&target_addr_, 0, sizeof(target_addr_));
+
+    target_addr_.sin_family = AF_INET;
+    target_addr_.sin_port = htons(target_port_);
+
+    if (inet_pton(AF_INET, target_ip_.c_str(), &target_addr_.sin_addr) <= 0)
+    {RCLCPP_ERROR(this->get_logger(), "Invalid target IP: %s", target_ip_.c_str()); close(sock_); sock_ = -1; return false;}
+
+    RCLCPP_INFO(this->get_logger(), "UDP initialized: local=0.0.0.0:%d, target=%s:%d", local_port_, target_ip_.c_str(), target_port_); return true;}
 
     // ================= 生命周期 =================
     CallbackReturn on_configure(const rclcpp_lifecycle::State &)
@@ -89,46 +124,6 @@ public:
         target_ip_ = this->get_parameter("target_ip").as_string();
         target_port_ = this->get_parameter("target_port").as_int();
 
-        // 创建UDP socket
-        sock_ = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sock_ < 0) {
-            RCLCPP_ERROR(this->get_logger(), "UDP socket create failed");
-            return CallbackReturn::FAILURE;
-        }
-        
-        int opt = 1;
-        setsockopt(sock_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        
-        memset(&local_addr_, 0, sizeof(local_addr_));
-        local_addr_.sin_family = AF_INET;
-        local_addr_.sin_port = htons(local_port_);
-        
-        if (inet_pton(AF_INET, local_ip_.c_str(), &local_addr_.sin_addr) <= 0) {
-            RCLCPP_ERROR(this->get_logger(), "Invalid local IP: %s", local_ip_.c_str());
-            close(sock_);
-            sock_ = -1;
-            return CallbackReturn::FAILURE;
-        }
-
-        if (bind(sock_, reinterpret_cast<sockaddr*>(&local_addr_), sizeof(local_addr_)) < 0) {
-            RCLCPP_ERROR(this->get_logger(), "UDP bind failed: %s:%d, errno=%d", local_ip_.c_str(), local_port_, errno);
-            close(sock_);
-            sock_ = -1;
-            return CallbackReturn::FAILURE;
-        }
-        
-        memset(&target_addr_, 0, sizeof(target_addr_));
-        target_addr_.sin_family = AF_INET;
-        target_addr_.sin_port = htons(target_port_);
-
-        if (inet_pton(AF_INET, target_ip_.c_str(), &target_addr_.sin_addr) <= 0) {
-            RCLCPP_ERROR(this->get_logger(), "Invalid target IP: %s", target_ip_.c_str()); close(sock_);
-            sock_ = -1;
-            return CallbackReturn::FAILURE;
-        }
-
-        timer_ = this->create_wall_timer(std::chrono::milliseconds(20),std::bind(&BspCommNode::udp_send, this));
-
         return CallbackReturn::SUCCESS;
     }
 
@@ -136,22 +131,37 @@ public:
     {
         active_ = true;
         udp_recv_running_ = true;
-        udp_recv_thread_ = std::thread(&BspCommNode::udp_receive_function, this);
-        return CallbackReturn::SUCCESS;
 
         if (light_control_pub_) {light_control_pub_->on_activate();}
         if (antenna_control_pub_) {antenna_control_pub_->on_activate();}
         if (mode_control_pub_) {mode_control_pub_->on_activate();}
         if (remote_control_pub_) {remote_control_pub_->on_activate();}
         if (dvl_control_pub_) {dvl_control_pub_->on_activate();}
+        if (lifecycle_states_control_pub_) {lifecycle_states_control_pub_->on_activate();}
+        
+        if (!init_udp_socket()) {RCLCPP_WARN(this->get_logger(), "UDP initialization failed. " "Node remains active and will retry.");}
+        
+        udp_recv_thread_ = std::thread(&BspCommNode::udp_receive_function, this);
+        timer_ = this->create_wall_timer(std::chrono::milliseconds(20), std::bind(&BspCommNode::udp_send, this));
+        return CallbackReturn::SUCCESS;
     }
 
     CallbackReturn on_deactivate(const rclcpp_lifecycle::State &)
     {
         active_ = false;
+        timer_.reset();
         udp_recv_running_ = false;
         if (sock_ >= 0) {::shutdown(sock_, SHUT_RDWR);}
         if (udp_recv_thread_.joinable()) {udp_recv_thread_.join();}
+        if (sock_ >= 0) {close(sock_); sock_ = -1;}
+        
+        if (light_control_pub_) {light_control_pub_->on_deactivate();}
+        if (antenna_control_pub_) {antenna_control_pub_->on_deactivate();}
+        if (mode_control_pub_) {mode_control_pub_->on_deactivate();}
+        if (remote_control_pub_) {remote_control_pub_->on_deactivate();}
+        if (dvl_control_pub_) {dvl_control_pub_->on_deactivate();}
+        if (lifecycle_states_control_pub_) {lifecycle_states_control_pub_->on_deactivate();}
+        
         return CallbackReturn::SUCCESS;
     }
 
@@ -167,20 +177,16 @@ public:
         armmotor_sub_.reset();
         antenna_sub_.reset();
         color_image_sub_.reset();
-        timer_.reset();
+        lifecycle_states_sub_.reset();
         
+        timer_.reset();
+        active_ = false;
         udp_recv_running_ = false;
         if (sock_ >= 0) {::shutdown(sock_, SHUT_RDWR);}
         if (udp_recv_thread_.joinable()) { udp_recv_thread_.join();}
-
         if (sock_ >= 0) {close(sock_); sock_ = -1;}
         
         cv::destroyAllWindows();
-
-        if (sock_ >= 0) {
-            close(sock_);
-            sock_ = -1;
-        }
 
         return CallbackReturn::SUCCESS;
     }
@@ -735,36 +741,46 @@ private:
     // ================= UDP接收 =================
     void udp_receive_function()
     {
-        RCLCPP_INFO(this->get_logger(), "UDP receive thread started, listening on %s:%d", local_ip_.c_str(), local_port_);
+        RCLCPP_INFO(this->get_logger(), "UDP receive thread started, listening on port %d", local_port_);
 
         uint8_t buffer[2048];
 
-        while (udp_recv_running_) {
-            sockaddr_in sender_addr{};
+        while (udp_recv_running_)
+        {
+            if (sock_ < 0) {std::this_thread::sleep_for(std::chrono::milliseconds(500)); continue;}
+
+            sockaddr_in sender_addr {};
             socklen_t sender_len = sizeof(sender_addr);
 
             ssize_t recv_len = recvfrom(sock_, buffer, sizeof(buffer), 0, reinterpret_cast<sockaddr*>(&sender_addr), &sender_len);
 
-            if (recv_len <= 0) {
-                if (udp_recv_running_) {
-                    RCLCPP_WARN(this->get_logger(), "UDP recvfrom failed");
+            if (recv_len < 0)
+            {
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                {
+                    continue;
                 }
+
+                if (!udp_recv_running_) 
+                {
+                    break;
+                }
+
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "UDP recvfrom failed, errno=%d (%s)", errno, strerror(errno));
+                continue;
+            }
+
+            if (recv_len == 0)
+            {
                 continue;
             }
 
             char sender_ip[INET_ADDRSTRLEN] = {0};
             inet_ntop(AF_INET, &sender_addr.sin_addr, sender_ip, sizeof(sender_ip));
             int sender_port = ntohs(sender_addr.sin_port);
+            RCLCPP_DEBUG(this->get_logger(), "Received UDP packet from %s:%d, length=%ld", sender_ip, sender_port, recv_len);
 
-            std::string hex_str;
-            char tmp[8];
-
-            for (ssize_t i = 0; i < recv_len; ++i) {
-                snprintf(tmp, sizeof(tmp), "%02X ", buffer[i]);
-                hex_str += tmp;
-            }
-
-            std::vector<uint8_t> frame(buffer, buffer + recv_len);
+            std::vector<uint8_t> frame( buffer, buffer + recv_len);
             handle_command_frame(frame);
         }
 
