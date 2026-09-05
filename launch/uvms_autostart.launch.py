@@ -185,6 +185,8 @@ def generate_launch_description():
 
     autostart = LaunchConfiguration("autostart")
     require_power_feedback = LaunchConfiguration("require_power_feedback")
+    auto_power_on = LaunchConfiguration("auto_power_on")
+    auto_12v_delay_ms = LaunchConfiguration("auto_12v_delay_ms")
     power_stabilize_ms = LaunchConfiguration("power_stabilize_ms")
 
     lifecycle_bringup_max_attempts = LaunchConfiguration(
@@ -369,6 +371,17 @@ def generate_launch_description():
                 value_type=bool,
             ),
 
+            # Automatically request 72 V first, then 12 V after a delay.
+            "auto_power_on": ParameterValue(
+                auto_power_on,
+                value_type=bool,
+            ),
+
+            "auto_12v_delay_ms": ParameterValue(
+                auto_12v_delay_ms,
+                value_type=int,
+            ),
+
             "power_stabilize_ms": ParameterValue(
                 power_stabilize_ms,
                 value_type=int,
@@ -421,6 +434,7 @@ def generate_launch_description():
                 "/hal_inertialnavi_node",
                 "/hal_light_sw_pwm_node",
                 "/hal_binocamera_node",
+                "/hal_servo_node",
             ],
 
             # --------------------------------------------------------------
@@ -431,7 +445,6 @@ def generate_launch_description():
                 "/hal_depthsensor_node",
                 "/hal_acoustic_node",
                 "/hal_cabinmotor_node",
-                "/hal_servo_node",
                 "/hal_antenna_lifecycle_node",
             ],
 
@@ -462,6 +475,16 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "require_power_feedback",
             default_value="true",
+        ),
+
+        DeclareLaunchArgument(
+            "auto_power_on",
+            default_value="true",
+        ),
+
+        DeclareLaunchArgument(
+            "auto_12v_delay_ms",
+            default_value="1000",
         ),
 
         DeclareLaunchArgument(

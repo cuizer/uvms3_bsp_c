@@ -13,6 +13,7 @@
 
 #include "hal/msg/hal_battery.hpp"
 #include "hal/msg/hal_lifecyclestates_control.hpp"
+#include "hal/srv/hal_battery_control_srv.hpp"
 #include "lifecycle_msgs/msg/state.hpp"
 #include "lifecycle_msgs/msg/transition.hpp"
 #include "lifecycle_msgs/srv/change_state.hpp"
@@ -31,6 +32,10 @@ public:
     declare_parameter<bool>("require_power_feedback", true);
     declare_parameter<double>("service_timeout_s", 5.0);
     declare_parameter<double>("min_48v_voltage", 36.0);
+
+    // Automatically request 72 V ON first, then request 12 V ON after this delay.
+    declare_parameter<bool>("auto_power_on", true);
+    declare_parameter<int>("auto_12v_delay_ms", 1000);
 
     // A rail must remain ON for this long before its lifecycle group starts configure.
     declare_parameter<int>("power_stabilize_ms", 2000);
@@ -57,12 +62,13 @@ public:
 
     declare_parameter<std::vector<std::string>>(
       "rail_12v_lifecycle_nodes",
-      {"/hal_inertialnavi_node", "/hal_light_sw_pwm_node", "/hal_binocamera_node"});
+      {"/hal_inertialnavi_node", "/hal_light_sw_pwm_node", "/hal_binocamera_node",
+        "/hal_servo_node"});
 
     declare_parameter<std::vector<std::string>>(
       "rail_24v_lifecycle_nodes",
       {"/hal_dvl_node", "/hal_depthsensor_node", "/hal_acoustic_node",
-        "/hal_cabinmotor_node", "/hal_servo_node", "/hal_antenna_lifecycle_node"});
+        "/hal_cabinmotor_node", "/hal_antenna_lifecycle_node"});
 
     // Thruster is special: activation gate is 72 V AND 12 V.
     declare_parameter<std::vector<std::string>>(
@@ -72,6 +78,11 @@ public:
     require_power_feedback_ = get_parameter("require_power_feedback").as_bool();
     service_timeout_ = seconds_parameter("service_timeout_s");
     min_48v_voltage_ = get_parameter("min_48v_voltage").as_double();
+    auto_power_on_ = get_parameter("auto_power_on").as_bool();
+
+    const auto auto_12v_delay_ms = get_parameter("auto_12v_delay_ms").as_int();
+    auto_12v_delay_ =
+      std::chrono::milliseconds(auto_12v_delay_ms < 0 ? 0 : auto_12v_delay_ms);
 
     const auto power_stabilize_ms = get_parameter("power_stabilize_ms").as_int();
     power_stabilize_delay_ =
@@ -104,6 +115,9 @@ public:
       "/hal/battery",
       rclcpp::QoS(10).reliable(),
       std::bind(&BspStartupManagerNode::battery_callback, this, std::placeholders::_1));
+
+    battery_control_client_ =
+      create_client<hal::srv::HalBatteryControlSrv>("/hal/batterycontrol");
 
     lifecycle_control_sub_ =
       create_subscription<hal::msg::HalLifecyclestatesControl>(
@@ -322,6 +336,48 @@ private:
     return latest_battery_;
   }
 
+  bool send_battery_control_command(uint8_t command, const std::string & description)
+  {
+    if (!battery_control_client_) {
+      RCLCPP_ERROR(get_logger(), "Battery control client is not initialized.");
+      return false;
+    }
+
+    if (!battery_control_client_->wait_for_service(service_timeout_)) {
+      RCLCPP_WARN(
+        get_logger(), "Battery control service unavailable while requesting: %s",
+        description.c_str());
+      return false;
+    }
+
+    auto request = std::make_shared<hal::srv::HalBatteryControlSrv::Request>();
+    request->command = command;
+
+    RCLCPP_INFO(
+      get_logger(), "Sending battery control command: %s, command=%u",
+      description.c_str(), static_cast<unsigned>(command));
+
+    auto future = battery_control_client_->async_send_request(request);
+    if (future.wait_for(service_timeout_) != std::future_status::ready) {
+      RCLCPP_ERROR(
+        get_logger(), "Battery control request timeout: %s", description.c_str());
+      return false;
+    }
+
+    const auto response = future.get();
+    if (!response->success) {
+      RCLCPP_ERROR(
+        get_logger(), "Battery control failed: %s, response=%s",
+        description.c_str(), response->message.c_str());
+      return false;
+    }
+
+    RCLCPP_INFO(
+      get_logger(), "Battery control accepted: %s, response=%s",
+      description.c_str(), response->message.c_str());
+    return true;
+  }
+
   void start_worker()
   {
     std::lock_guard<std::mutex> lock(worker_mutex_);
@@ -344,8 +400,8 @@ private:
 
     // ------------------------------------------------------------------------
     // Battery + bsp_comm are always attempted first. A bsp_comm failure must not
-    // block later rail groups forever; with power feedback enabled, hal_battery
-    // is the required initial node because it provides rail switch states.
+    // block later rail groups forever; hal_battery is the required initial node
+    // because it provides the power-control service and rail feedback.
     // ------------------------------------------------------------------------
     GroupRuntime initial_runtime;
     initial_runtime.power_on_since = Clock::now();
@@ -358,21 +414,66 @@ private:
     GroupRuntime rail_12v_runtime;
     GroupRuntime rail_24v_runtime;
     GroupRuntime thruster_runtime;
+
     bool power_groups_enabled = false;
+    bool initial_required_ready = false;
+
+    // Automatic power-on state:
+    //   hal_battery ACTIVE -> command 5 (72 V ON)
+    //   wait auto_12v_delay_ -> command 1 (12 V ON)
+    bool auto_72v_command_sent = false;
+    bool auto_12v_command_sent = false;
+    std::optional<Clock::time_point> auto_72v_command_time;
 
     while (rclcpp::ok() && !stop_requested()) {
       process_group(
         "initial", initial_nodes_, true, initial_runtime,
         std::chrono::milliseconds(0));
 
+      // Check the required initial nodes independently. This intentionally allows
+      // a bsp_comm failure to not block the power-dependent HAL nodes.
+      if (!initial_required_ready) {
+        initial_required_ready = required_initial_nodes_active();
+        if (initial_required_ready) {
+          RCLCPP_INFO(get_logger(), "Required initial lifecycle nodes are ACTIVE.");
+        }
+      }
+
       if (!power_groups_enabled &&
-        (initial_runtime.completed || !require_power_feedback_ ||
-        required_initial_nodes_active()))
+        (initial_runtime.completed || !require_power_feedback_ || initial_required_ready))
       {
         power_groups_enabled = true;
         RCLCPP_INFO(
           get_logger(),
           "Initial lifecycle gate is ready. Entering power-feedback-driven bringup.");
+      }
+
+      // ----------------------------------------------------------------------
+      // Automatic power-on sequence.
+      // Only send commands after the battery lifecycle node is ACTIVE, because
+      // /hal/batterycontrol is created during battery configure.
+      // ----------------------------------------------------------------------
+      if (auto_power_on_ && initial_required_ready && !auto_12v_command_sent) {
+        if (!auto_72v_command_sent) {
+          if (send_battery_control_command(5, "72V ON")) {
+            auto_72v_command_sent = true;
+            auto_72v_command_time = Clock::now();
+            RCLCPP_INFO(
+              get_logger(),
+              "72V ON command accepted. Waiting %ld ms before enabling 12V.",
+              static_cast<long>(auto_12v_delay_.count()));
+          }
+        } else if (auto_72v_command_time.has_value() &&
+          Clock::now() - *auto_72v_command_time >= auto_12v_delay_)
+        {
+          if (send_battery_control_command(1, "12V ON")) {
+            auto_12v_command_sent = true;
+            RCLCPP_INFO(
+              get_logger(),
+              "Automatic power-on sequence completed: 72V ON -> delay %ld ms -> 12V ON.",
+              static_cast<long>(auto_12v_delay_.count()));
+          }
+        }
       }
 
       if (!power_groups_enabled) {
@@ -402,7 +503,7 @@ private:
       process_group("12V", rail_12v_nodes_, v12_on, rail_12v_runtime, power_stabilize_delay_);
       process_group("24V", rail_24v_nodes_, v24_on, rail_24v_runtime, power_stabilize_delay_);
 
-      // Thruster must not be brought up unless BOTH rails are present.
+      // Thruster must not be brought up unless BOTH rails are physically present.
       process_group(
         "thruster(72V+12V)", thruster_nodes_, v72_on && v12_on,
         thruster_runtime, power_stabilize_delay_);
@@ -746,11 +847,13 @@ private:
 
   bool autostart_{true};
   bool require_power_feedback_{true};
+  bool auto_power_on_{true};
   bool worker_started_{false};
   bool shutting_down_{false};
 
   double min_48v_voltage_{36.0};
   std::chrono::milliseconds service_timeout_{5000};
+  std::chrono::milliseconds auto_12v_delay_{1000};
   std::chrono::milliseconds power_stabilize_delay_{2000};
   std::chrono::milliseconds configure_to_activate_delay_{5000};
   int lifecycle_bringup_max_attempts_{3};
@@ -765,6 +868,7 @@ private:
 
   rclcpp::TimerBase::SharedPtr startup_timer_;
   rclcpp::Subscription<hal::msg::HalBattery>::SharedPtr battery_sub_;
+  rclcpp::Client<hal::srv::HalBatteryControlSrv>::SharedPtr battery_control_client_;
   rclcpp::Subscription<hal::msg::HalLifecyclestatesControl>::SharedPtr
     lifecycle_control_sub_;
 
