@@ -131,6 +131,7 @@ public:
     {
         active_ = true;
         udp_recv_running_ = true;
+        
 
         if (light_control_pub_) {light_control_pub_->on_activate();}
         if (antenna_control_pub_) {antenna_control_pub_->on_activate();}
