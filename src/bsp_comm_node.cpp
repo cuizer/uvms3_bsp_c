@@ -583,6 +583,22 @@ private:
     }  
     
     // ================= UDP发送 =================
+    
+    bool send_udp_packet(const std::vector<uint8_t>& packet)
+    {
+        if (sock_ < 0) {return false;}
+
+        ssize_t sent_len = sendto(sock_, packet.data(), packet.size(), 0, reinterpret_cast<struct sockaddr*>(&target_addr_), sizeof(target_addr_));
+
+        if (sent_len < 0)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "UDP send failed, errno=%d (%s)", errno,strerror(errno));
+            return false;
+        }
+
+        return true;
+    }
+    
     void udp_send()
     {
         if (!active_) return;
@@ -602,7 +618,7 @@ private:
             auto payload = pack_inertial(msg);
             auto packet = build_packet(0x01, payload);
 
-            sendto(sock_, packet.data(), packet.size(), 0, reinterpret_cast<struct sockaddr*>(&target_addr_), sizeof(target_addr_));
+            send_udp_packet(packet);
         } 
 
     // ---------- DVL ----------
@@ -617,7 +633,7 @@ private:
             auto payload = pack_dvl(msg);
             auto packet = build_packet(0x02, payload);
 
-            sendto(sock_, packet.data(), packet.size(), 0, reinterpret_cast<struct sockaddr*>(&target_addr_), sizeof(target_addr_));
+            send_udp_packet(packet);
         }
 
     // ---------- Depthsensor ----------
@@ -632,7 +648,7 @@ private:
             auto payload = pack_depthsensor(msg);
             auto packet = build_packet(0x03, payload);
             
-            sendto(sock_, packet.data(), packet.size(), 0, reinterpret_cast<struct sockaddr*>(&target_addr_), sizeof(target_addr_));
+            send_udp_packet(packet);
         }
         
     // ---------- Mainthruster ----------
@@ -647,7 +663,7 @@ private:
             auto payload = pack_mainthruster(msg);
             auto packet = build_packet(0x04, payload);
             
-            sendto(sock_, packet.data(), packet.size(), 0, reinterpret_cast<struct sockaddr*>(&target_addr_), sizeof(target_addr_));
+            send_udp_packet(packet);
         }
         
     // ---------- Auxithruster ----------
@@ -662,7 +678,7 @@ private:
             auto payload = pack_auxithruster(msg);
             auto packet = build_packet(0x05, payload);
             
-            sendto(sock_, packet.data(), packet.size(), 0, reinterpret_cast<struct sockaddr*>(&target_addr_), sizeof(target_addr_));
+            send_udp_packet(packet);
         }
         
     // ---------- Battery ----------
@@ -677,7 +693,7 @@ private:
             auto payload = pack_battery(msg);
             auto packet = build_packet(0x06, payload);
             
-            sendto(sock_, packet.data(), packet.size(), 0, reinterpret_cast<struct sockaddr*>(&target_addr_), sizeof(target_addr_));
+            send_udp_packet(packet);
         }
         
     // ---------- Tailservo ----------
@@ -692,7 +708,7 @@ private:
             auto payload = pack_tailservo(msg);
             auto packet = build_packet(0x07, payload);
             
-            sendto(sock_, packet.data(), packet.size(), 0, reinterpret_cast<struct sockaddr*>(&target_addr_), sizeof(target_addr_));
+            send_udp_packet(packet);
         }
         
     // ---------- Armmotor ----------
@@ -707,7 +723,7 @@ private:
             auto payload = pack_armmotor(msg);
             auto packet = build_packet(0x09, payload);
             
-            sendto(sock_, packet.data(), packet.size(), 0, reinterpret_cast<struct sockaddr*>(&target_addr_), sizeof(target_addr_));
+            send_udp_packet(packet);
         }
         
     // ---------- Antenna ----------
@@ -722,7 +738,7 @@ private:
             auto payload = pack_antenna(msg);
             auto packet = build_packet(0x12, payload);
             
-            sendto(sock_, packet.data(), packet.size(), 0, reinterpret_cast<struct sockaddr*>(&target_addr_), sizeof(target_addr_));
+            send_udp_packet(packet);
         }
    
     // ---------- Lifecycle ----------     
@@ -732,7 +748,7 @@ private:
             auto payload = pack_lifecycle_states(msg);
             auto packet = build_packet(0x15, payload);
 
-            sendto(sock_, packet.data(), packet.size(), 0, reinterpret_cast<struct sockaddr*>(&target_addr_), sizeof(target_addr_));
+            send_udp_packet(packet);
         }
         
         
@@ -747,7 +763,16 @@ private:
 
         while (udp_recv_running_)
         {
-            if (sock_ < 0) {std::this_thread::sleep_for(std::chrono::milliseconds(500)); continue;}
+            if (sock_ < 0) 
+            {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "UDP socket unavailable, trying to recreate...");
+                if (!init_udp_socket())
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+                }
+
+            }
 
             sockaddr_in sender_addr {};
             socklen_t sender_len = sizeof(sender_addr);
