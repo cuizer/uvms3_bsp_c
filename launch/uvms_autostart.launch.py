@@ -333,11 +333,25 @@ def generate_launch_description():
         output="screen",
     )
 
+    # ======================================================================
+    # bsp_motioncontrol_node 参数基线:
+    #   优先: 环境变量 BSP_MOTION_CFG 指定的外置 YAML (现场调参固化, 免重编);
+    #   回退: 随包安装的 config/bsp_motioncontrol.yaml (出厂默认基线)。
+    # 外置文件未设置/缺失时自动回退包内默认, 不会导致启动失败。
+    # ======================================================================
+    _bsp_installed_cfg = os.path.join(
+        get_package_share_directory("bsp"), "config", "bsp_motioncontrol.yaml")
+    _bsp_override_cfg = os.environ.get("BSP_MOTION_CFG", "")
+    bsp_motion_cfg = (
+        _bsp_override_cfg if _bsp_override_cfg and os.path.exists(_bsp_override_cfg)
+        else _bsp_installed_cfg)
+
     bsp_motion = LifecycleNode(
         package="bsp",
         executable="bsp_motioncontrol_node",
         name="bsp_motioncontrol_node",
         output="screen",
+        parameters=[bsp_motion_cfg],
     )
 
     # ==========================================================================
